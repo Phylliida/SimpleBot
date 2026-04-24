@@ -11,6 +11,51 @@ KIND_ONE_AT_A_TIME = 'one_at_a_time'
 KIND_PERSISTENT = 'persistent'
 
 
+async def probe_ready(worker, connect_timeout=1.0, http_timeout=3.0):
+    """Return True if the worker is ready to serve.
+
+    If the worker has a `health_path`, issue an HTTP GET and require a 200
+    response. Otherwise just verify TCP accepts a connection.
+    """
+    port = worker['port']
+    health_path = worker.get('health_path')
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection('127.0.0.1', port),
+            timeout=connect_timeout,
+        )
+    except (ConnectionRefusedError, OSError, asyncio.TimeoutError):
+        return False
+    try:
+        if not health_path:
+            return True
+        req = (f"GET {health_path} HTTP/1.1\r\n"
+               f"Host: 127.0.0.1\r\nConnection: close\r\n\r\n").encode()
+        writer.write(req)
+        await writer.drain()
+        response = await asyncio.wait_for(reader.read(1024), timeout=http_timeout)
+        return b"200 OK" in response
+    except Exception:
+        return False
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def wait_for_ready(worker, timeout=180.0, interval=0.5):
+    """Poll probe_ready until it succeeds or the timeout elapses."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if await probe_ready(worker):
+            return True
+        await asyncio.sleep(interval)
+    return False
+
+
 def discover_workers():
     workers = []
     for kind, base in [(KIND_ONE_AT_A_TIME, ONE_AT_A_TIME_DIR), (KIND_PERSISTENT, PERSISTENT_DIR)]:
@@ -30,7 +75,21 @@ def discover_workers():
             except Exception as e:
                 print(f"[Manager] Skipping {worker_dir}: invalid port.txt ({e})")
                 continue
-            workers.append({'name': name, 'dir': worker_dir, 'port': port, 'kind': kind})
+            health_path = None
+            health_file = os.path.join(worker_dir, 'health_path.txt')
+            if os.path.isfile(health_file):
+                try:
+                    with open(health_file, 'r') as f:
+                        health_path = f.read().strip() or None
+                except Exception as e:
+                    print(f"[Manager] Ignoring health_path.txt in {worker_dir}: {e}")
+            workers.append({
+                'name': name,
+                'dir': worker_dir,
+                'port': port,
+                'kind': kind,
+                'health_path': health_path,
+            })
     return workers
 
 
@@ -87,35 +146,41 @@ class WorkerManager:
                     stderr=None,
                 )
                 self.current_worker = name
-                await asyncio.sleep(2.0)
-                self.one_at_a_time_health_task = asyncio.create_task(self.one_at_a_time_health_loop(worker))
-                print(f"[Manager] Worker {name} should now be active.")
-                return True
             except Exception as e:
                 print(f"[Manager] Error starting worker {name}: {e}")
+                self.current_process = None
+                self.current_worker = None
                 return False
+
+            # Block until the backend is actually ready (TCP accept, or HTTP 200
+            # on health_path if configured) so the first proxied request doesn't
+            # hit a not-yet-listening port or a loading server.
+            probe_desc = f"GET {worker['health_path']}" if worker.get('health_path') else "TCP accept"
+            print(f"[Manager] Waiting for {name} to become ready on port {worker['port']} ({probe_desc})...")
+            ready = await wait_for_ready(worker, timeout=180.0)
+            if not ready:
+                print(f"[Manager] Worker {name} never started listening. Tearing down.")
+                try:
+                    self.current_process.terminate()
+                except ProcessLookupError:
+                    pass
+                self.current_process = None
+                self.current_worker = None
+                return False
+
+            self.one_at_a_time_health_task = asyncio.create_task(self.one_at_a_time_health_loop(worker))
+            print(f"[Manager] Worker {name} is accepting connections.")
+            return True
 
     async def one_at_a_time_health_loop(self, worker):
         name = worker['name']
-        port = worker['port']
         while True:
-            try:
-                await asyncio.sleep(90)
-                reader, writer = await asyncio.wait_for(
-                    asyncio.open_connection('127.0.0.1', port),
-                    timeout=5.0,
-                )
-                writer.write(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
-                await writer.drain()
-                response = await reader.read(1024)
-                writer.close()
-                await writer.wait_closed()
-                if b"200 OK" not in response:
-                    raise Exception("Health check response not 200 OK")
-            except Exception as e:
-                print(f"[Manager] Health check failed for {name}: {e}. Restarting...")
-                asyncio.create_task(self.start_one_at_a_time(worker, force=True))
-                break
+            await asyncio.sleep(90)
+            if await probe_ready(worker, connect_timeout=5.0, http_timeout=5.0):
+                continue
+            print(f"[Manager] Health check failed for {name}. Restarting...")
+            asyncio.create_task(self.start_one_at_a_time(worker, force=True))
+            break
 
     # ---------- persistent ----------
 
@@ -137,28 +202,16 @@ class WorkerManager:
 
     async def persistent_health_loop(self, worker):
         name = worker['name']
-        port = worker['port']
-        # Give the process a moment to come up before first probe.
+        # Give the process a moment to come up before the first probe.
         await asyncio.sleep(5.0)
         while True:
             await asyncio.sleep(30)
             proc = self.persistent_processes.get(name)
             alive = proc is not None and proc.poll() is None
-            reachable = False
-            if alive:
-                try:
-                    reader, writer = await asyncio.wait_for(
-                        asyncio.open_connection('127.0.0.1', port),
-                        timeout=5.0,
-                    )
-                    writer.close()
-                    await writer.wait_closed()
-                    reachable = True
-                except Exception:
-                    reachable = False
+            reachable = alive and await probe_ready(worker, connect_timeout=5.0, http_timeout=5.0)
             if alive and reachable:
                 continue
-            reason = "process exited" if not alive else f"port {port} unreachable"
+            reason = "process exited" if not alive else "health probe failed"
             print(f"[Manager] Persistent worker {name} unhealthy ({reason}). Restarting...")
             if proc is not None:
                 try:

@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 set -euo pipefail
-exec python /home/bepis/prog/SimpleBot/repos/SimpleRSSWebui/app.py
+cd "$(dirname "$0")"
+exec python ../../repos/SimpleRSSWebui/app.py
