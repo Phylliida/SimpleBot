@@ -1,1 +1,0 @@
-gemma-4-31B-it-Q4_K_M.gguf
