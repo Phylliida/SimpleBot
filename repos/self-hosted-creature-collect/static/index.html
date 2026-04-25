@@ -2542,6 +2542,18 @@
       <input type="checkbox" id="wifiOnlyToggle">
     </div>
     <div class="row">
+      <label for="creatureModeToggle">Creature mode</label>
+      <input type="checkbox" id="creatureModeToggle" checked>
+    </div>
+    <div class="row">
+      <label>Creature sprites</label>
+      <span>
+        <button id="spritesDownloadBtn" type="button" style="padding: 6px 10px; font-size: 13px;">↓ download</button>
+        <button id="spritesClearBtn" type="button" style="padding: 6px 10px; font-size: 13px; margin-left: 4px;">clear</button>
+      </span>
+    </div>
+    <div id="spritesStatus" style="font-size: 11px; color: var(--ui-muted); margin: -4px 0 6px;"></div>
+    <div class="row">
       <label>Backup</label>
       <span>
         <button id="exportBtn" type="button" style="padding: 6px 10px; font-size: 13px; margin-right: 4px;">Export</button>
@@ -2597,6 +2609,10 @@
 </div>
 <script src="/static/vendor/maplibre-gl.js"></script>
 <script src="/static/trip-planner.js"></script>
+<script src="/static/spawns.js"></script>
+<script src="/static/sprites.js"></script>
+<script src="/static/species.js"></script>
+<script src="/static/creatures.js"></script>
 <script>
 // Single source of truth for the app version. Bumped manually when shipping
 // a user-visible change (new features, data format upgrades, etc.). Shown
@@ -3746,6 +3762,7 @@ function fmtDate(ts) {
   }
   map.addControl(new RoutingControl(), 'bottom-right');
   map.addControl(new SettingsControl(), 'bottom-right');
+  const creatureUi = Creatures.install(map);
   map.addControl(new maplibregl.NavigationControl(), 'bottom-right');
 
   map.on('moveend', () => {
@@ -3763,6 +3780,7 @@ function fmtDate(ts) {
     positionOptions: { enableHighAccuracy: true },
     trackUserLocation: true,
     showUserHeading: true,
+    showAccuracyCircle: false,
     fitBoundsOptions: { maxZoom: 15 }
   });
   map.addControl(geolocate, 'bottom-right');
@@ -3772,6 +3790,33 @@ function fmtDate(ts) {
       geolocate.trigger();
       localStorage.setItem('cc.geoPromptDone', '1');
     }
+  });
+
+  // Prompt for location permission on first load and any time the tab
+  // regains focus, but only if the browser is still in 'prompt' state.
+  // Skips re-asking when permission is already granted or has been
+  // denied (browser blocks re-prompts in that case anyway).
+  async function ensureLocationPermission() {
+    if (!navigator.geolocation) return;
+    if (navigator.permissions) {
+      try {
+        const s = await navigator.permissions.query({ name: 'geolocation' });
+        if (s.state !== 'prompt') return;
+      } catch { /* fall through and try anyway */ }
+    }
+    // Empty callbacks — we just want to surface the prompt. The actual
+    // GPS watch is owned by creatures.js (when creature-mode is on)
+    // and by the maplibre GeolocateControl button.
+    navigator.geolocation.getCurrentPosition(
+      () => {},
+      () => {},
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 5 * 60 * 1000 }
+    );
+  }
+  ensureLocationPermission();
+  window.addEventListener('focus', ensureLocationPermission);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') ensureLocationPermission();
   });
 
   geolocate.on('error', (e) => {
@@ -4112,6 +4157,16 @@ function fmtDate(ts) {
       themeCustom: JSON.parse(localStorage.getItem('cc.themeCustom') || 'null'),
       units: localStorage.getItem('cc.units'),
       view: JSON.parse(localStorage.getItem('cc.view.v1') || 'null'),
+      // Creature collection — your caught pokemon + the nicknames you
+      // gave them. Sort prefs and mode travel too so preferences land
+      // on the new device. Sprite cache (IDB) is NOT exported; users
+      // re-run the download on the target device.
+      captured: JSON.parse(localStorage.getItem('cc.capturedCreatures') || '[]'),
+      creatureNicknames: JSON.parse(localStorage.getItem('cc.creatureNicknames') || '{}'),
+      creatureSortBy: localStorage.getItem('cc.creatureSortBy'),
+      creatureSortDir: localStorage.getItem('cc.creatureSortDir'),
+      creatureMode: localStorage.getItem('cc.creatureMode'),
+      caughtSpawnIds: JSON.parse(localStorage.getItem('cc.caughtSpawnIds') || '[]'),
     };
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
@@ -4165,7 +4220,47 @@ function fmtDate(ts) {
       unitsSelect.value = data.units;
       scaleCtrl.setUnit(data.units === 'mi' ? 'imperial' : 'metric');
     }
-    alert(`Imported: ${favAdded} favorite(s) (${favSkipped} skipped as duplicate), ${regAdded} region(s)`);
+    // Creature collection: merge by capture id (skip duplicates), union
+    // caught-spawn IDs, merge nicknames with current device winning on
+    // conflict (user just renamed something here — don't clobber it).
+    let creaturesAdded = 0, creaturesSkipped = 0;
+    if (Array.isArray(data.captured)) {
+      const existing = JSON.parse(localStorage.getItem('cc.capturedCreatures') || '[]');
+      const existingIds = new Set(existing.map((c) => c && c.id));
+      const merged = existing.slice();
+      for (const c of data.captured) {
+        if (!c || !c.id) continue;
+        if (existingIds.has(c.id)) { creaturesSkipped++; continue; }
+        merged.push(c);
+        creaturesAdded++;
+      }
+      localStorage.setItem('cc.capturedCreatures', JSON.stringify(merged));
+    }
+    if (data.creatureNicknames && typeof data.creatureNicknames === 'object') {
+      const current = JSON.parse(localStorage.getItem('cc.creatureNicknames') || '{}');
+      const merged = { ...data.creatureNicknames, ...current };
+      localStorage.setItem('cc.creatureNicknames', JSON.stringify(merged));
+    }
+    if (Array.isArray(data.caughtSpawnIds)) {
+      const existing = new Set(
+        JSON.parse(localStorage.getItem('cc.caughtSpawnIds') || '[]'));
+      for (const id of data.caughtSpawnIds) existing.add(id);
+      localStorage.setItem('cc.caughtSpawnIds', JSON.stringify([...existing]));
+    }
+    if (data.creatureSortBy && !localStorage.getItem('cc.creatureSortBy')) {
+      localStorage.setItem('cc.creatureSortBy', data.creatureSortBy);
+    }
+    if (data.creatureSortDir && !localStorage.getItem('cc.creatureSortDir')) {
+      localStorage.setItem('cc.creatureSortDir', data.creatureSortDir);
+    }
+    if (data.creatureMode && !localStorage.getItem('cc.creatureMode')) {
+      localStorage.setItem('cc.creatureMode', data.creatureMode);
+    }
+    alert(
+      `Imported: ${favAdded} favorite(s) (${favSkipped} skipped), ` +
+      `${regAdded} region(s), ` +
+      `${creaturesAdded} creature(s) (${creaturesSkipped} skipped)`
+    );
   }
   document.getElementById('exportBtn').onclick = () => exportData();
   document.getElementById('importBtn').onclick = () => document.getElementById('importFile').click();
@@ -5712,6 +5807,24 @@ function fmtDate(ts) {
   map.on('mouseleave', 'route-stop-bubbles', () => { map.getCanvas().style.cursor = ''; });
 
   let allPois = await loadAllPois();
+
+  // Hand creatures.js a locally-scoped POI query — the POI array lives
+  // inside this IIFE and we don't want to scatter loadAllPois() calls.
+  // Returns the nearest POI with a name within `maxMeters`, or null.
+  window.CreatureCollectAPI = {
+    findNearestNamedPoi(lat, lng, maxMeters = 500) {
+      let best = null, bestKm = Infinity;
+      for (const p of allPois) {
+        if (!p || !p.name) continue;
+        const d = haversineKm(lat, lng, p.lat, p.lng);
+        if (d < bestKm) { bestKm = d; best = p; }
+      }
+      if (!best) return null;
+      const distanceM = bestKm * 1000;
+      if (distanceM > maxMeters) return null;
+      return { name: best.name, lat: best.lat, lng: best.lng, distanceM };
+    },
+  };
 
   const searchInput = document.getElementById('searchInput');
   const searchFilter = document.getElementById('searchFilter');
@@ -7880,6 +7993,122 @@ function fmtDate(ts) {
     wifiToggle.checked = localStorage.getItem('cc.wifiOnly') === '1';
     wifiToggle.addEventListener('change', () => {
       localStorage.setItem('cc.wifiOnly', wifiToggle.checked ? '1' : '0');
+    });
+  }
+
+  const creatureToggle = document.getElementById('creatureModeToggle');
+  if (creatureToggle && typeof creatureUi !== 'undefined') {
+    creatureToggle.checked = creatureUi.isEnabled();
+    creatureToggle.addEventListener('change', () => {
+      creatureUi.setEnabled(creatureToggle.checked);
+    });
+  }
+
+  // Creature sprite bulk download: fetches all 150 fusion sheets, crops
+  // every (a, b) pair for a, b in [1,150] into the IDB icon cache, and
+  // tracks progress in localStorage so a refresh resumes cleanly.
+  const spritesBtn = document.getElementById('spritesDownloadBtn');
+  const spritesClearBtn = document.getElementById('spritesClearBtn');
+  const spritesStatus = document.getElementById('spritesStatus');
+  const SPRITE_SHEETS = 150;
+  let _spriteDlAbort = null;
+
+  async function updateSpritesStatus(extra) {
+    if (!spritesStatus) return;
+    if (typeof window.Sprites === 'undefined') {
+      spritesStatus.textContent = 'sprite module not loaded';
+      return;
+    }
+    if (extra) { spritesStatus.textContent = extra; return; }
+    try {
+      const s = await window.Sprites.getDownloadStatus({
+        sheetFrom: 1, sheetTo: SPRITE_SHEETS,
+        indexFrom: 1, indexTo: 150,
+      });
+      if (s.iconsPresent === 0) {
+        spritesStatus.textContent = 'not downloaded';
+      } else if (s.iconsPresent === s.iconsTotal) {
+        spritesStatus.textContent = `all ${s.iconsTotal} sprites ready`;
+      } else {
+        spritesStatus.textContent =
+          `${s.iconsPresent}/${s.iconsTotal} sprites ` +
+          `· ${s.sheetsComplete.size}/${s.sheetsTotal} sheets complete`;
+      }
+    } catch (e) {
+      spritesStatus.textContent = `status error: ${e && e.message ? e.message : e}`;
+    }
+  }
+  updateSpritesStatus();
+
+  if (spritesBtn) {
+    spritesBtn.addEventListener('click', async () => {
+      if (typeof window.Sprites === 'undefined') return;
+      if (_spriteDlAbort) {
+        _spriteDlAbort.abort();
+        return;
+      }
+      const pre = await window.Sprites.getDownloadStatus({
+        sheetFrom: 1, sheetTo: SPRITE_SHEETS, indexFrom: 1, indexTo: 150,
+      });
+      const sheetsRemaining = pre.sheetsTotal - pre.sheetsComplete.size;
+      const iconsRemaining = pre.iconsTotal - pre.iconsPresent;
+      if (iconsRemaining === 0) {
+        updateSpritesStatus();
+        return;
+      }
+      const ok = confirm(
+        `${iconsRemaining} sprite${iconsRemaining === 1 ? '' : 's'} ` +
+        `remaining across ${sheetsRemaining} sheet${sheetsRemaining === 1 ? '' : 's'} ` +
+        `(~${Math.round(sheetsRemaining * 1.5)} MB). Use WiFi. Continue?`
+      );
+      if (!ok) return;
+      if (navigator.storage && navigator.storage.persist) {
+        try { await navigator.storage.persist(); } catch {}
+      }
+      _spriteDlAbort = new AbortController();
+      spritesBtn.textContent = 'cancel';
+      try {
+        const result = await window.Sprites.bulkDownload({
+          sheetFrom: 1, sheetTo: SPRITE_SHEETS,
+          indexFrom: 1, indexTo: 150,
+          signal: _spriteDlAbort.signal,
+          onProgress: ({ sheetsDone, sheetsTotal, currentSheet, indexInSheet, phase }) => {
+            if (phase === 'repairing') {
+              spritesStatus.textContent = `repairing legacy crops (${indexInSheet} scanned)`;
+              return;
+            }
+            const tag = phase === 'fetching' ? 'fetching'
+              : phase === 'cropping' ? 'cropping'
+              : 'done';
+            spritesStatus.textContent =
+              `${sheetsDone}/${sheetsTotal} — ${tag} sheet ${currentSheet}`;
+          },
+        });
+        if (result.cancelled) updateSpritesStatus('cancelled');
+        else updateSpritesStatus();
+      } catch (e) {
+        updateSpritesStatus(`error: ${e && e.message ? e.message : e}`);
+      } finally {
+        _spriteDlAbort = null;
+        spritesBtn.textContent = '↓ download';
+      }
+    });
+  }
+
+  if (spritesClearBtn) {
+    spritesClearBtn.addEventListener('click', async () => {
+      if (typeof window.Sprites === 'undefined') return;
+      if (_spriteDlAbort) {
+        _spriteDlAbort.abort();
+        return;
+      }
+      if (!confirm('Delete all cached creature sprites?')) return;
+      try {
+        await window.Sprites.deleteAllSprites();
+        updateSpritesStatus();
+      } catch (e) {
+        updateSpritesStatus(`error: ${e && e.message ? e.message : e}`);
+      }
     });
   }
 })();

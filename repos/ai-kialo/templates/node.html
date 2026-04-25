@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}{{ node.text[:50] }}{% endblock %}
+{% block content %}
+
+{% if parent %}
+  <p class="breadcrumb">
+    ← <a href="{{ url_for('view_node', nid=parent.id) }}">{{ parent.text }}</a>
+  </p>
+{% endif %}
+
+<article class="claim claim-{{ node.stance }}">
+  <span class="stance-tag">{{ node.stance }}</span>
+  {% set s = label_score(node.label) %}
+  {% if s %}
+    {% if node.reasoning %}
+      <details class="reasoning-box" open>
+        <summary class="label score-{{ s }}" title="{{ node.label }}"><span class="badge-num">{{ s }}</span><span class="badge-eq"> = {{ node.label }}</span></summary>
+        <p>{{ node.reasoning }}</p>
+        {% include "_score_legend.html" %}
+      </details>
+    {% else %}
+      <form action="{{ url_for('explain_route', nid=node.id) }}" method="post" class="why-form">
+        <button type="submit" class="label score-{{ s }}" title="{{ node.label }} — click for an explanation">{{ s }}</button>
+      </form>
+    {% endif %}
+  {% endif %}
+  <h1>{{ node.text }}</h1>
+  {% if node.conv is not none %}
+    <p class="meta">conv {{ "%.2f" | format(node.conv) }}{% if node.uncert is not none %} · uncert {{ "%.2f" | format(node.uncert) }}{% endif %}</p>
+  {% endif %}
+</article>
+
+{% if negations %}
+<section class="negations">
+  <h3>Linked negations</h3>
+  <ul class="claim-list">
+    {% for n in negations %}
+      <li><a href="{{ url_for('view_node', nid=n.id) }}">{{ n.text }}</a></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
+<section class="pros-cons">
+  <div class="col col-pros">
+    <h3>Pros ({{ pros | length }})</h3>
+    {% if pros %}
+      <ul class="claim-list">
+        {% for p in pros %}
+          <li>
+            {% set s = label_score(p.label) %}
+            {% if s %}
+              {% if p.reasoning %}
+                <details class="reasoning-box" open>
+                  <summary class="label score-{{ s }}" title="{{ p.label }}"><span class="badge-num">{{ s }}</span><span class="badge-eq"> = {{ p.label }}</span></summary>
+                  <p>{{ p.reasoning }}</p>
+                  {% include "_score_legend.html" %}
+                </details>
+              {% else %}
+                <form action="{{ url_for('explain_route', nid=p.id) }}" method="post" class="why-form">
+                  <button type="submit" class="label score-{{ s }}" title="{{ p.label }} — click for an explanation">{{ s }}</button>
+                </form>
+              {% endif %}
+            {% endif %}
+            <a href="{{ url_for('view_node', nid=p.id) }}">{{ p.text }}</a>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="muted">No pros yet.</p>
+    {% endif %}
+  </div>
+
+  <div class="col col-cons">
+    <h3>Cons ({{ cons | length }})</h3>
+    {% if cons %}
+      <ul class="claim-list">
+        {% for c in cons %}
+          <li>
+            {% set s = label_score(c.label) %}
+            {% if s %}
+              {% if c.reasoning %}
+                <details class="reasoning-box" open>
+                  <summary class="label score-{{ s }}" title="{{ c.label }}"><span class="badge-num">{{ s }}</span><span class="badge-eq"> = {{ c.label }}</span></summary>
+                  <p>{{ c.reasoning }}</p>
+                  {% include "_score_legend.html" %}
+                </details>
+              {% else %}
+                <form action="{{ url_for('explain_route', nid=c.id) }}" method="post" class="why-form">
+                  <button type="submit" class="label score-{{ s }}" title="{{ c.label }} — click for an explanation">{{ s }}</button>
+                </form>
+              {% endif %}
+            {% endif %}
+            <a href="{{ url_for('view_node', nid=c.id) }}">{{ c.text }}</a>
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="muted">No cons yet.</p>
+    {% endif %}
+  </div>
+</section>
+
+<section class="add-child">
+  <h3>Add your own argument</h3>
+  <form action="{{ url_for('add_child_route', nid=node.id) }}" method="post">
+    <textarea name="text" rows="2" required placeholder="A self-contained pro or con (don't use 'it'/'this' to refer to the parent)..."></textarea>
+    <div class="add-buttons">
+      <button type="submit" name="stance" value="pro" class="btn-pro">Add as Pro</button>
+      <button type="submit" name="stance" value="con" class="btn-con">Add as Con</button>
+    </div>
+  </form>
+</section>
+
+<section class="actions">
+  <form action="{{ url_for('expand', nid=node.id) }}" method="post" class="inline">
+    <input type="hidden" name="n_pros" value="2">
+    <input type="hidden" name="n_cons" value="2">
+    <button type="submit">Expand (2 pros + 2 cons)</button>
+  </form>
+
+  <form action="{{ url_for('delete', nid=node.id) }}" method="post" class="inline" onsubmit="return confirm('Delete this claim?');">
+    <button type="submit" class="danger">Delete</button>
+  </form>
+</section>
+
+{% endblock %}

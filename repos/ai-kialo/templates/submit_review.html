@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+{% block title %}Review submission{% endblock %}
+{% block content %}
+
+<section class="review">
+  <h2>This looks like an existing claim</h2>
+
+  <article class="claim">
+    <span class="stance-tag">your submission</span>
+    <p>{{ text }}</p>
+  </article>
+
+  <p class="meta">
+    Verdict: <strong>{{ classification.verdict }}</strong>
+    · confidence {{ "%.2f" | format(classification.confidence) }}
+  </p>
+  {% if classification.reasoning %}
+    <p class="reasoning">{{ classification.reasoning }}</p>
+  {% endif %}
+
+  {% if match %}
+    <h3>Existing claim:</h3>
+    <article class="claim claim-existing">
+      <p><a href="{{ url_for('view_node', nid=match.id) }}">{{ match.text }}</a></p>
+    </article>
+  {% endif %}
+
+  <div class="actions">
+    {% if classification.verdict == "duplicate" and match %}
+      <form action="{{ url_for('submit_confirm') }}" method="post" class="inline">
+        <input type="hidden" name="text" value="{{ text }}">
+        <input type="hidden" name="related_to" value="{{ match.id }}">
+        <input type="hidden" name="action" value="use_existing">
+        <button type="submit">Use the existing claim</button>
+      </form>
+    {% elif classification.verdict == "negation" and match %}
+      <form action="{{ url_for('submit_confirm') }}" method="post" class="inline">
+        <input type="hidden" name="text" value="{{ text }}">
+        <input type="hidden" name="related_to" value="{{ match.id }}">
+        <input type="hidden" name="action" value="link_negation">
+        <button type="submit">Create new + link as negation</button>
+      </form>
+    {% endif %}
+
+    <form action="{{ url_for('submit_confirm') }}" method="post" class="inline">
+      <input type="hidden" name="text" value="{{ text }}">
+      <input type="hidden" name="action" value="force_new">
+      <button type="submit">Create as new claim anyway</button>
+    </form>
+
+    <a href="{{ url_for('index') }}" class="btn-link">Cancel</a>
+  </div>
+</section>
+
+{% endblock %}

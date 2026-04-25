@@ -204,6 +204,33 @@ def icons_list():
     return {"files": sorted(f.name for f in d.iterdir() if f.name.endswith(".svg"))}
 
 
+@app.route("/creature-names")
+def creature_names():
+    # Plain-text "one species name per line", 1-indexed (line 1 == pokemon 1).
+    # Returned as a JSON array so the client can store/index it trivially.
+    path = ROOT / "data" / "Battlers" / "pokemon.txt"
+    if not path.is_file():
+        abort(404)
+    names = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    resp = jsonify(names)
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
+
+
+@app.route("/creature-sprite/<int:sheet>")
+def creature_sprite(sheet):
+    # Each sheet is a 960×4896 PNG holding 10×51 fusion sprites at 96×96.
+    # The client fetches a sheet the first time any creature in that
+    # fusion "partner B" family is shown, crops the needed index, caches
+    # the individual sprite in IndexedDB, and drops the sheet.
+    path = ROOT / "data" / "Battlers" / "spritesheets_autogen" / f"{sheet}.png"
+    if not path.is_file():
+        abort(404)
+    resp = send_from_directory(path.parent, path.name, mimetype="image/png")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
+
+
 # Field codes for binary POI props. Keys must stay in lock-step with the
 # client's POI_FIELDS array — reordering here breaks existing IDB data.
 POI_FIELDS = [
@@ -1054,4 +1081,4 @@ def schedule():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8464)
+    app.run(host="0.0.0.0", port=8464, debug=True)

@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block title %}ai-kialo · root claims{% endblock %}
+{% block content %}
+
+<section class="submit">
+  <h2>Submit a claim</h2>
+  <form action="{{ url_for('submit') }}" method="post">
+    <textarea name="text" rows="3" required placeholder="A claim you want to explore (e.g. &quot;Universal basic income should be implemented.&quot;)"></textarea>
+    <button type="submit">Submit</button>
+  </form>
+</section>
+
+<section class="roots">
+  <h2>Existing roots ({{ roots | length }})</h2>
+  {% if roots %}
+    <ul class="claim-list">
+      {% for n in roots %}
+        <li>
+          {% set s = label_score(n.label) %}
+          {% if s %}
+            {% if n.reasoning %}
+              <details class="reasoning-box" open>
+                <summary class="label score-{{ s }}" title="{{ n.label }}"><span class="badge-num">{{ s }}</span><span class="badge-eq"> = {{ n.label }}</span></summary>
+                <p>{{ n.reasoning }}</p>
+                {% include "_score_legend.html" %}
+              </details>
+            {% else %}
+              <form action="{{ url_for('explain_route', nid=n.id) }}" method="post" class="why-form">
+                <button type="submit" class="label score-{{ s }}" title="{{ n.label }} — click for an explanation">{{ s }}</button>
+              </form>
+            {% endif %}
+          {% endif %}
+          <a href="{{ url_for('view_node', nid=n.id) }}">{{ n.text }}</a>
+          {% if n.children %}<span class="meta">· {{ n.children | length }} children</span>{% endif %}
+        </li>
+      {% endfor %}
+    </ul>
+  {% else %}
+    <p class="muted">No claims yet — submit one above.</p>
+  {% endif %}
+</section>
+
+{% endblock %}

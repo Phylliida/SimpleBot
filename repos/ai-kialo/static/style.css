@@ -1,0 +1,270 @@
+/* ai-kialo — minimal styling */
+
+:root {
+  --bg: #fafaf9;
+  --fg: #1a1a1a;
+  --muted: #666;
+  --accent: #2563eb;
+  --pro: #15803d;
+  --con: #b91c1c;
+  --negation: #6b21a8;
+  --border: #e5e5e5;
+  --bg-soft: #ffffff;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+  margin: 0;
+  line-height: 1.5;
+}
+
+header {
+  background: var(--bg-soft);
+  border-bottom: 1px solid var(--border);
+  padding: 0.8rem 1.5rem;
+}
+
+.brand {
+  font-weight: 600;
+  text-decoration: none;
+  color: var(--fg);
+  font-size: 1.1rem;
+}
+
+/* "?" disclosure for the score scale, shown at the bottom of each open
+   reasoning panel rather than in the header. */
+.legend-inline {
+  display: block;
+  margin-top: 0.5rem;
+  font-size: 0.85rem;
+}
+.legend-inline summary {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.3em;
+  height: 1.3em;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.75rem;
+  font-weight: 600;
+  list-style: none;
+  user-select: none;
+  background: var(--bg);
+}
+.legend-inline summary::-webkit-details-marker { display: none; }
+.legend-inline summary::marker { display: none; }
+.legend-inline summary:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.legend-inline[open] > ul {
+  margin-top: 0.4rem;
+  padding: 0.5rem 0.8rem;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+.legend-inline ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.legend-inline li {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.15rem 0;
+}
+
+main {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 2rem 1.5rem;
+}
+
+h1 { font-size: 1.6rem; margin: 0 0 0.5rem; }
+h2 { font-size: 1.3rem; margin: 1.5rem 0 0.8rem; }
+h3 { font-size: 1.05rem; margin: 1rem 0 0.5rem; color: var(--muted); }
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.muted, .meta { color: var(--muted); font-size: 0.9rem; }
+
+textarea, input[type="text"] {
+  width: 100%;
+  padding: 0.6rem;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: 1rem;
+  resize: vertical;
+}
+
+button {
+  background: var(--accent);
+  color: white;
+  border: 0;
+  padding: 0.55rem 1rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.95rem;
+  font-family: inherit;
+}
+button:hover { filter: brightness(1.1); }
+button.danger { background: var(--con); }
+
+.btn-link {
+  padding: 0.55rem 1rem;
+  display: inline-block;
+}
+
+form .inline, .inline { display: inline-block; margin-right: 0.5rem; }
+
+.submit form button { margin-top: 0.5rem; }
+
+.claim-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0;
+}
+.claim-list li {
+  padding: 0.5rem 0.7rem;
+  border-bottom: 1px solid var(--border);
+}
+.claim-list li:last-child { border-bottom: 0; }
+
+.claim {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 4px solid var(--muted);
+  padding: 1rem 1.2rem;
+  border-radius: 4px;
+  margin: 1rem 0;
+}
+.claim-pro { border-left-color: var(--pro); }
+.claim-con { border-left-color: var(--con); }
+.claim-existing { border-left-color: var(--accent); }
+
+.stance-tag {
+  display: inline-block;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-bottom: 0.4rem;
+}
+
+.breadcrumb { color: var(--muted); font-size: 0.95rem; margin-bottom: 0.8rem; }
+
+.pros-cons {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.5rem;
+  margin: 1.5rem 0;
+}
+.col-pros h3 { color: var(--pro); }
+.col-cons h3 { color: var(--con); }
+
+.actions { margin-top: 1.5rem; }
+
+.reasoning {
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  padding: 0.7rem 1rem;
+  border-radius: 4px;
+  font-size: 0.93rem;
+  color: var(--muted);
+}
+
+.negations h3 { color: var(--negation); }
+
+/* Compellingness score badge — numeric 1-5, color-coded. Hover the badge
+   to see the underlying word label via the tooltip. */
+.label {
+  display: inline-block;
+  min-width: 1.4em;
+  padding: 0.1em 0.4em;
+  border-radius: 3px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  margin-right: 0.5em;
+  vertical-align: 0.1em;
+  color: white;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.score-5 { background: #15803d; }
+.score-4 { background: #65a30d; }
+.score-3 { background: #ca8a04; }
+.score-2 { background: #ea580c; }
+.score-1 { background: #b91c1c; }
+
+.add-child { margin: 1.5rem 0; }
+.add-child textarea { margin-bottom: 0.5rem; }
+.add-buttons { display: flex; gap: 0.5rem; }
+.btn-pro { background: var(--pro); }
+.btn-con { background: var(--con); }
+
+/* Disclosure widget exposing the LLM's reasoning for a score. */
+.reasoning-box {
+  display: block;
+  margin-top: 0.3rem;
+  font-size: 0.9rem;
+}
+.reasoning-box summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.8rem;
+  display: inline-block;
+  padding: 0.05em 0.4em;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  user-select: none;
+}
+.reasoning-box summary:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.reasoning-box[open] summary {
+  margin-bottom: 0.4rem;
+}
+.reasoning-box p {
+  margin: 0;
+  padding: 0.6rem 0.8rem;
+  background: var(--bg-soft);
+  border-left: 3px solid var(--border);
+  border-radius: 0 3px 3px 0;
+  color: var(--fg);
+}
+
+/* The badge itself is the click target for the on-demand /explain call.
+   When no reasoning is cached: badge renders as <button class="label score-X"> in
+   a form posting to /explain. When cached: badge is the <summary> of a <details>
+   that expands to reveal the reasoning. Both cases use the same visual styling. */
+.why-form { display: inline-block; margin: 0; }
+button.label, summary.label {
+  border: 0;
+  cursor: pointer;
+  font-family: inherit;
+  /* font-size, font-weight, padding, color, etc. inherit from .label + .score-X */
+}
+button.label:hover, summary.label:hover {
+  filter: brightness(1.15);
+}
+/* Strip default disclosure triangle so summary looks identical to button. */
+summary.label { list-style: none; }
+summary.label::-webkit-details-marker { display: none; }
+summary.label::marker { display: none; }
+
+/* Badge content: just the number when collapsed, "N = label" when expanded.
+   The badge stretches naturally to fit the longer text. */
+summary.label .badge-eq { display: none; }
+details[open] > summary.label .badge-eq { display: inline; }
