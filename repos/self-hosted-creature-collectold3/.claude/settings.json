@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(done)",
+      "Bash(ls:*)",
+      "Bash(git:*)",
+      "Bash(find:*)",
+      "Bash(wc:*)",
+      "Bash(./scripts/check.sh:*)",
+      "Bash(VERUS_ROOT=../verus ./scripts/check.sh:*)",
+      "Bash(VERUS_Z3_PATH=/Users/yams/Prog/verus-cad/verus/source/target-verus/release/z3 VERUS_ROOT=../verus ./scripts/check.sh:*)",
+      "Bash(grep:*)",
+      "Bash(VERUS_ROOT=../verus2 ./scripts/check.sh:*)",
+      "Bash(cargo check:*)",
+      "Bash(../verus/source/target-verus/release/cargo-verus verus:*)",
+      "Bash(bash:*)",
+      "Bash(~/.verus/verus-x86-linux/verus:*)",
+      "Bash(cargo build:*)"
+    ]
+  },
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
+  "skipDangerousModePermissionPrompt": true,
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$CLAUDE_PROJECT_DIR/.claude/hooks/block-forbidden-verus.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

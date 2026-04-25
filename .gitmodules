@@ -1,0 +1,3 @@
+[submodule "repos/self-hosted-creature-collect"]
+	path = repos/self-hosted-creature-collect
+	url = https://github.com/Phylliida/self-hosted-creature-collect.git
