@@ -207,6 +207,107 @@ form .inline, .inline { display: inline-block; margin-right: 0.5rem; }
 .score-2 { background: #ea580c; }
 .score-1 { background: #b91c1c; }
 
+/* Self-containment status pill, shown inline near the score badge on a
+   non-root's own page. Two states: "self-contained" (positive, green) or
+   "needs parent context" (warn, amber). Hover shows the LLM's reasoning
+   via the title attribute. */
+.sc-tag {
+  display: inline-block;
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0.18em 0.55em;
+  border-radius: 3px;
+  margin-right: 0.5rem;
+  vertical-align: 0.15em;
+  cursor: help;
+  font-family: inherit;
+}
+.sc-yes { background: #d1fae5; color: #065f46; border: 1px solid #6ee7b7; }
+.sc-no  { background: #fef3c7; color: #92400e; border: 1px solid #fcd34d; }
+
+/* The pill is a clickable form-button — clicking flips between self-contained
+   and references-parent (manual override of the LLM's verdict). */
+.sc-toggle-form { display: inline; margin: 0; }
+button.sc-tag { cursor: pointer; }
+button.sc-tag:hover { filter: brightness(1.07); }
+
+/* "Needs parent context" notice on a non-root's own page when the LLM judged
+   the claim isn't fully self-contained. */
+.context-notice {
+  margin: 0.6rem 0 1rem;
+  padding: 0.6rem 0.9rem;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--negation);
+  border-radius: 0 4px 4px 0;
+  font-size: 0.92rem;
+  color: var(--fg);
+}
+.context-tag {
+  display: inline-block;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  margin-right: 0.4rem;
+}
+.context-why { margin-top: 0.4rem; font-size: 0.85rem; }
+.context-why summary { cursor: pointer; color: var(--muted); }
+.context-why p { margin: 0.3rem 0 0; color: var(--fg); }
+
+/* Expand button moved up: visual breathing room above the pros/cons grid. */
+.expand-top { margin: 0.6rem 0 1rem; }
+
+/* Aliased child link — small ↗ marker so the user knows clicking takes them
+   elsewhere in the tree (the existing dedup'd node, not a fresh page). */
+.alias-mark {
+  font-size: 0.85em;
+  color: var(--muted);
+  margin-left: 0.15em;
+  vertical-align: 0.15em;
+}
+.aliased-link:hover .alias-mark { color: var(--accent); }
+
+/* Sort-by-score/newest/oldest controls above the pros/cons grid. */
+.sort-controls {
+  margin: 0.6rem 0;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+.sort-controls a {
+  margin: 0 0.1em;
+  text-decoration: none;
+  color: var(--accent);
+}
+.sort-controls a:hover { text-decoration: underline; }
+.sort-controls a.active {
+  color: var(--fg);
+  font-weight: 600;
+  text-decoration: underline;
+  cursor: default;
+}
+
+/* Banner shown while streaming expansion is in progress. */
+.expanding-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.6rem 0.9rem;
+  margin: 0.8rem 0;
+  background: var(--bg-soft);
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 4px 4px 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+}
+/* Override display:flex so the [hidden] attribute on the pre-rendered
+   placeholder actually hides it (browsers default `[hidden]` to display:none,
+   but a more-specific class rule wins without this). */
+.expanding-banner[hidden] { display: none; }
+
 .add-child { margin: 1.5rem 0; }
 .add-child textarea { margin-bottom: 0.5rem; }
 .add-buttons { display: flex; gap: 0.5rem; }
@@ -214,30 +315,24 @@ form .inline, .inline { display: inline-block; margin-right: 0.5rem; }
 .btn-con { background: var(--con); }
 
 /* Disclosure widget exposing the LLM's reasoning for a score. */
-.reasoning-box {
+/* Reasoning panel — sits below the claim text. Hidden by default; shown when
+   its associated `.reason-toggle` checkbox above is checked. The checkbox is
+   marked `checked` in HTML on initial render so cached reasoning is visible
+   by default, and a click on the badge collapses it. */
+.reasoning-box { display: none; }
+.reason-toggle:checked ~ .reasoning-box {
   display: block;
-  margin-top: 0.3rem;
-  font-size: 0.9rem;
+  margin-top: 0.6rem;
+  font-size: 0.92rem;
 }
-.reasoning-box summary {
-  cursor: pointer;
+.reasoning-title {
+  margin: 0 0 0.4rem;
+  font-size: 0.92rem;
   color: var(--muted);
-  font-size: 0.8rem;
-  display: inline-block;
-  padding: 0.05em 0.4em;
-  border: 1px solid var(--border);
-  border-radius: 3px;
-  user-select: none;
+  font-weight: normal;
 }
-.reasoning-box summary:hover {
-  color: var(--accent);
-  border-color: var(--accent);
-}
-.reasoning-box[open] summary {
-  margin-bottom: 0.4rem;
-}
-.reasoning-box p {
-  margin: 0;
+.reasoning-text {
+  margin: 0 0 0.5rem;
   padding: 0.6rem 0.8rem;
   background: var(--bg-soft);
   border-left: 3px solid var(--border);
@@ -264,7 +359,46 @@ summary.label { list-style: none; }
 summary.label::-webkit-details-marker { display: none; }
 summary.label::marker { display: none; }
 
-/* Badge content: just the number when collapsed, "N = label" when expanded.
-   The badge stretches naturally to fit the longer text. */
-summary.label .badge-eq { display: none; }
-details[open] > summary.label .badge-eq { display: inline; }
+/* Checkbox-as-toggle pattern: clicking the score badge above the claim toggles
+   a hidden checkbox; the sibling reasoning-box below shows/hides via CSS general-
+   sibling selector. No JS needed for this collapse/expand. */
+.reason-toggle { display: none; }
+label.label {
+  /* a <label> styled as a badge — same look as button.label / summary.label */
+  border: 0;
+  cursor: pointer;
+  font-family: inherit;
+  display: inline-block;
+  user-select: none;
+}
+label.label:hover { filter: brightness(1.15); }
+.reason-toggle:checked + label.label {
+  /* subtle outline so the user can tell the panel is currently expanded */
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.18);
+}
+
+/* Inline badge inside the "Why ..." title shouldn't have the .label margin-right
+   tail (it makes the spacing on each side of the badge asymmetric). */
+.reasoning-box .reasoning-title .label { margin-right: 0; }
+
+/* Spinner shown while the LLM is generating a "Why?" explanation.
+   The placeholder lives in the DOM (hidden) wherever the reasoning panel will
+   eventually render; tiny JS in base.html unhides it on form submit. */
+.why-spinner-pending {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin: 0.6rem 0;
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+.why-spinner-pending[hidden] { display: none; }
+.spinner {
+  width: 1em;
+  height: 1em;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }

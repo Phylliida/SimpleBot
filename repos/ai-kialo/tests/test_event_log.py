@@ -198,6 +198,46 @@ def test_resolve_handles_deleted_target(tmp_path):
     assert resolve(nodes, "n1") is None
 
 
+def test_node_aliased_adds_extra_parent_edge(tmp_path):
+    """node_aliased adds an additional parent→child edge without creating a new node.
+    The aliased child shows up in the new parent's children alongside its original
+    parent's children list."""
+    log = EventLog(tmp_path / "log.jsonl")
+    _root(log, "p1", "parent one")
+    _root(log, "p2", "parent two")
+    _child(log, "c", "p1", "pro", "child of p1")
+    log.append({"t": "node_aliased", "parent": "p2", "child": "c", "reason": "dedup"})
+    nodes = log.replay()
+    assert "c" in nodes["p1"].children   # original parent
+    assert "c" in nodes["p2"].children   # extra parent via alias
+    assert "p2" in nodes["c"].aliased_in
+
+
+def test_node_aliased_no_duplicate_in_children(tmp_path):
+    """Same alias emitted twice doesn't add the child twice."""
+    log = EventLog(tmp_path / "log.jsonl")
+    _root(log, "p1", "p1")
+    _root(log, "p2", "p2")
+    _child(log, "c", "p1", "pro", "c")
+    log.append({"t": "node_aliased", "parent": "p2", "child": "c"})
+    log.append({"t": "node_aliased", "parent": "p2", "child": "c"})
+    nodes = log.replay()
+    assert nodes["p2"].children.count("c") == 1
+
+
+def test_aliased_child_excluded_when_deleted(tmp_path):
+    """If the aliased child gets deleted, it stops appearing under the alias parent."""
+    log = EventLog(tmp_path / "log.jsonl")
+    _root(log, "p1", "p1")
+    _root(log, "p2", "p2")
+    _child(log, "c", "p1", "pro", "c")
+    log.append({"t": "node_aliased", "parent": "p2", "child": "c"})
+    log.append({"t": "node_deleted", "id": "c"})
+    nodes = log.replay()
+    assert "c" not in nodes["p2"].children
+    assert "c" not in nodes["p1"].children
+
+
 def test_replay_reconstructs_from_disk_only(tmp_path):
     """Writing via one EventLog and reading via a fresh one yields the same state."""
     path = tmp_path / "log.jsonl"

@@ -12,5 +12,68 @@
   <main>
     {% block content %}{% endblock %}
   </main>
+  <script>
+    // When the user submits a "Why?" score-badge form, reveal the spinner
+    // placeholder that lives in the same parent. Form submits normally; server
+    // returns a 302 back to this page which re-renders with the cached reasoning.
+    document.addEventListener('submit', function (e) {
+      var form = e.target.closest && e.target.closest('.why-form');
+      if (!form) return;
+      var container = form.parentElement;
+      var spinner = container && container.querySelector('.why-spinner-pending');
+      if (spinner) spinner.hidden = false;
+    });
+
+    // Sort-by links: intercept clicks so we don't full-navigate (which would
+    // reset scroll position to the top). Fetch the new URL, replace just the
+    // sort-controls + pros-cons sections in place, and update the URL via
+    // pushState. Holding modifier keys / right-click falls back to native nav.
+    document.addEventListener('click', function (e) {
+      var link = e.target.closest && e.target.closest('.sort-controls a');
+      if (!link) return;
+      if (e.ctrlKey || e.metaKey || e.shiftKey || e.altKey || e.button !== 0) return;
+      e.preventDefault();
+      if (link.classList.contains('active')) return;  // already active, no-op
+      var url = link.href;
+      fetch(url, { headers: { 'Accept': 'text/html' } })
+        .then(function (r) { return r.text(); })
+        .then(function (html) {
+          var doc = new DOMParser().parseFromString(html, 'text/html');
+          var oldSort = document.querySelector('.sort-controls');
+          var newSort = doc.querySelector('.sort-controls');
+          if (oldSort && newSort) oldSort.replaceWith(newSort);
+          var oldList = document.querySelector('.pros-cons');
+          var newList = doc.querySelector('.pros-cons');
+          if (oldList && newList) oldList.replaceWith(newList);
+          window.history.pushState(null, '', url);
+        })
+        .catch(function () { window.location.href = url; });
+    });
+
+    // For the Expand button: skip the jarring instant click→navigate refresh.
+    // Submit via fetch, show the inline banner immediately, then ~1.5s later
+    // reload to the new URL (which has ?expanding=N) — at that point the
+    // server-rendered banner + 2s polling cycle takes over.
+    document.addEventListener('submit', function (e) {
+      var form = e.target.closest && e.target.closest('.expand-form');
+      if (!form) return;
+      e.preventDefault();
+      var banner = document.getElementById('expand-pending-banner');
+      if (banner) banner.hidden = false;
+      var formData = new FormData(form);
+      fetch(form.action, { method: 'POST', body: formData })
+        .then(function (response) {
+          // Update URL to match the redirect target so the upcoming reload
+          // lands on the ?expanding=N page (server-rendered banner + polling).
+          if (response && response.url) {
+            window.history.pushState(null, '', response.url);
+          }
+        })
+        .catch(function () { /* leave banner up; user can refresh */ })
+        .finally(function () {
+          setTimeout(function () { location.reload(); }, 1500);
+        });
+    });
+  </script>
 </body>
 </html>

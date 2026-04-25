@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from app import AppState, create_app
 from classify import ClassifierResult
 from event_log import EventLog
-from expand import GeneratedChild
+from expand import GeneratedChild, ContainmentResult
 from node_embeddings import NodeEmbeddings
 
 
@@ -51,16 +51,22 @@ class FakeExpander:
     explain_argument_should_raise: bool = False
     explain_claim_to_return: str | None = "fake-claim-reasoning"
     explain_claim_should_raise: bool = False
+    containment_to_return: ContainmentResult | None = field(
+        default_factory=lambda: ContainmentResult(containment="self-contained", reasoning="fake-sc")
+    )
+    containment_should_raise: bool = False
     calls: list = field(default_factory=list)
     score_calls: list = field(default_factory=list)
     score_claim_calls: list = field(default_factory=list)
     explain_argument_calls: list = field(default_factory=list)
     explain_claim_calls: list = field(default_factory=list)
+    containment_calls: list = field(default_factory=list)
 
-    def expand(self, claim_text, n_pros=2, n_cons=2, existing_pros=(), existing_cons=()):
+    def expand(self, claim_text, n_pros=2, n_cons=2, existing_pros=(), existing_cons=(), ancestors=()):
         existing_pros = list(existing_pros)
         existing_cons = list(existing_cons)
-        self.calls.append((claim_text, n_pros, n_cons, existing_pros, existing_cons))
+        ancestors = list(ancestors)
+        self.calls.append((claim_text, n_pros, n_cons, existing_pros, existing_cons, ancestors))
         if self.children_to_return:
             return list(self.children_to_return)
         po = len(existing_pros)
@@ -75,29 +81,35 @@ class FakeExpander:
             ) for i in range(n_cons)
         ]
 
-    def score_argument(self, parent_text, child_text, stance):
-        self.score_calls.append((parent_text, child_text, stance))
+    def score_argument(self, parent_text, child_text, stance, ancestors=()):
+        self.score_calls.append((parent_text, child_text, stance, list(ancestors)))
         if self.score_should_raise:
             raise RuntimeError("simulated scoring failure")
         return self.score_to_return
 
-    def score_claim(self, claim_text):
-        self.score_claim_calls.append(claim_text)
+    def score_claim(self, claim_text, ancestors=()):
+        self.score_claim_calls.append((claim_text, list(ancestors)))
         if self.score_claim_should_raise:
             raise RuntimeError("simulated claim-scoring failure")
         return self.score_claim_to_return
 
-    def explain_argument(self, parent_text, child_text, stance, label):
-        self.explain_argument_calls.append((parent_text, child_text, stance, label))
+    def explain_argument(self, parent_text, child_text, stance, label, ancestors=()):
+        self.explain_argument_calls.append((parent_text, child_text, stance, label, list(ancestors)))
         if self.explain_argument_should_raise:
             raise RuntimeError("simulated explain-arg failure")
         return self.explain_argument_to_return
 
-    def explain_claim(self, claim_text, label):
-        self.explain_claim_calls.append((claim_text, label))
+    def explain_claim(self, claim_text, label, ancestors=()):
+        self.explain_claim_calls.append((claim_text, label, list(ancestors)))
         if self.explain_claim_should_raise:
             raise RuntimeError("simulated explain-claim failure")
         return self.explain_claim_to_return
+
+    def check_containment(self, parent_text, child_text):
+        self.containment_calls.append((parent_text, child_text))
+        if self.containment_should_raise:
+            raise RuntimeError("simulated containment failure")
+        return self.containment_to_return
 
 
 # ---------- fixtures ----------
@@ -110,6 +122,9 @@ def state(tmp_path):
         node_embeddings=NodeEmbeddings(tmp_path / "node_embeddings.bin"),
         classifier=FakeClassifier(),
         expander=FakeExpander(),
+        # tests run /expand inline so assertions on the resulting state
+        # don't race a background worker
+        expand_synchronously=True,
     )
 
 
@@ -319,39 +334,56 @@ def test_expand_creates_pros_and_cons(client, state):
     assert len(cons) == 2
 
 
-def test_expand_calls_expander_with_parent_text(client, state):
+def test_expand_calls_expander_per_child_with_parent_text(client, state):
+    """Streaming: one LLM call per child. With n_pros=1, n_cons=1 we expect 2 calls."""
     state.classifier.default = ClassifierResult("new", None, 1.0, "")
     client.post("/submit", data={"text": "specific parent text"})
     nodes = state.replay()
     parent_id = next(iter(nodes))
     client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "1"})
-    assert state.expander.calls
-    text, n_pros, n_cons, existing_pros, existing_cons = state.expander.calls[0]
-    assert text == "specific parent text"
-    assert n_pros == 1
-    assert n_cons == 1
-    # No prior children — empty existing lists
-    assert existing_pros == []
-    assert existing_cons == []
+    assert len(state.expander.calls) == 2
+    # All calls reference the same parent text and ask for exactly 1 child each
+    for text, n_pros, n_cons, _, _, _ in state.expander.calls:
+        assert text == "specific parent text"
+        assert (n_pros, n_cons) in {(1, 0), (0, 1)}
+    pro_calls = [c for c in state.expander.calls if c[1] == 1]
+    con_calls = [c for c in state.expander.calls if c[2] == 1]
+    assert len(pro_calls) == 1 and len(con_calls) == 1
 
 
-def test_reexpand_passes_existing_children_to_expander(client, state):
-    """Second expand should include the first call's outputs in existing_pros/cons."""
+def test_expand_makes_n_calls_per_n_children(client, state):
+    """n_pros=2 + n_cons=3 should fire 5 single-child calls."""
     state.classifier.default = ClassifierResult("new", None, 1.0, "")
     client.post("/submit", data={"text": "parent"})
     nodes = state.replay()
     parent_id = next(iter(nodes))
-    # First expand: creates 2 pros + 2 cons
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "2", "n_cons": "3"})
+    assert len(state.expander.calls) == 5
+
+
+def test_reexpand_grows_existing_children_each_call(client, state):
+    """Each per-child call should see the children written by all previous calls.
+
+    With n_pros=2, n_cons=2 followed by another 2+2:
+      - Call 1 (pro): existing_pros=[]
+      - Call 2 (pro): existing_pros=[pro0]
+      - Call 3 (con): existing_cons=[]
+      - Call 4 (con): existing_cons=[con0]
+      - Call 5 (pro): existing_pros=[pro0, pro1]  ← second /expand starts here
+      ...
+    """
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
     client.post(f"/node/{parent_id}/expand", data={"n_pros": "2", "n_cons": "2"})
-    # Second expand: should pass the 4 created children as existing_pros/cons
     client.post(f"/node/{parent_id}/expand", data={"n_pros": "2", "n_cons": "2"})
-    assert len(state.expander.calls) == 2
-    _, _, _, existing_pros, existing_cons = state.expander.calls[1]
-    assert len(existing_pros) == 2
-    assert len(existing_cons) == 2
-    # texts from first round
-    assert "parent pro 0" in existing_pros
-    assert "parent con 0" in existing_cons
+    assert len(state.expander.calls) == 8
+    fifth_call = state.expander.calls[4]
+    _, n_pros5, _, existing_pros5, _, _ = fifth_call
+    assert n_pros5 == 1
+    assert "parent pro 0" in existing_pros5
+    assert "parent pro 1" in existing_pros5
 
 
 def test_reexpand_excludes_deleted_children_from_existing(client, state):
@@ -364,16 +396,240 @@ def test_reexpand_excludes_deleted_children_from_existing(client, state):
     nodes = state.replay()
     pros = [c for c in nodes[parent_id].children if nodes[c].stance == "pro"]
     client.post(f"/node/{pros[0]}/delete")
+    state.expander.calls.clear()  # drop calls from the first expand round
     client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
-    _, _, _, existing_pros, _ = state.expander.calls[1]
-    assert len(existing_pros) == 1  # the deleted one is gone
+    # one new pro call; existing should have 1 (the surviving pro), not 2
+    assert len(state.expander.calls) == 1
+    _, _, _, existing_pros, _, _ = state.expander.calls[0]
+    assert len(existing_pros) == 1
     assert nodes[pros[0]].text not in existing_pros
     assert nodes[pros[1]].text in existing_pros
+
+
+def test_expand_dedups_via_alias_when_match_found(client, state):
+    """When a generated child is similar enough to an existing same-stance node,
+    /expand emits a node_aliased event linking the existing node as a child of
+    the new parent — instead of creating a duplicate."""
+    from app import create_node, create_root
+
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    # Create two roots and an existing pro under the first
+    create_root(state, "Should we adopt renewable energy?")
+    nodes = state.replay()
+    root_a = next(iter(nodes))
+    create_root(state, "Should we phase out fossil fuels?")
+    nodes = state.replay()
+    root_b = next(rid for rid in nodes if rid != root_a)
+
+    existing_pro_text = "Renewable energy reduces greenhouse gas emissions"
+    existing_pro = create_node(state, existing_pro_text, root_a, "pro")
+
+    # Configure the FakeExpander to return a near-duplicate text for root B's expand
+    state.expander.children_to_return = [
+        GeneratedChild(text=existing_pro_text, stance="pro", label="strong"),
+    ]
+    client.post(f"/node/{root_b}/expand", data={"n_pros": "1", "n_cons": "0"})
+
+    nodes = state.replay()
+    # No new pro was created under root_b; instead the existing pro is aliased in
+    new_nodes_under_b = [
+        c for c in nodes[root_b].children
+        if c == existing_pro
+    ]
+    assert existing_pro in nodes[root_b].children, "existing pro should be aliased under root_b"
+    # The original pro is still under root_a too
+    assert existing_pro in nodes[root_a].children
+    # The aliased_in list reflects the new parent
+    assert root_b in nodes[existing_pro].aliased_in
+    # No new node with that text was created (the only node with this text is the original)
+    matches = [n for n in nodes.values() if n.text == existing_pro_text]
+    assert len(matches) == 1
+    assert matches[0].id == existing_pro
+
+
+def test_expand_no_dedup_when_text_dissimilar(client, state):
+    """If the generated text isn't close to any existing node, expand creates a
+    fresh node as normal — no alias."""
+    from app import create_node, create_root
+
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    create_root(state, "Cars should be electric")
+    nodes = state.replay()
+    root = next(iter(nodes))
+    create_node(state, "Electric motors are efficient", root, "pro")
+
+    # Generate something semantically unrelated → should create a new node, not alias
+    state.expander.children_to_return = [
+        GeneratedChild(text="Cookies taste good with milk", stance="pro", label="weak"),
+    ]
+    client.post(f"/node/{root}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    # New node was created under root with the new text
+    new_nodes = [n for n in nodes.values() if n.text == "Cookies taste good with milk"]
+    assert len(new_nodes) == 1
+    assert new_nodes[0].parent_id == root
+
+
+def test_aliased_child_renders_with_link_to_existing_node(client, state):
+    """The aliased child appears in the new parent's pros list with a link to
+    the existing node's page (not a new page)."""
+    from app import create_node, create_root
+
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    create_root(state, "First root")
+    nodes = state.replay()
+    root_a = next(iter(nodes))
+    create_root(state, "Second root")
+    nodes = state.replay()
+    root_b = next(rid for rid in nodes if rid != root_a)
+    existing_pro_text = "shared argument across both roots"
+    existing_pro = create_node(state, existing_pro_text, root_a, "pro")
+
+    state.expander.children_to_return = [
+        GeneratedChild(text=existing_pro_text, stance="pro", label="strong"),
+    ]
+    client.post(f"/node/{root_b}/expand", data={"n_pros": "1", "n_cons": "0"})
+
+    body = client.get(f"/node/{root_b}").data.decode()
+    # Link href points at the existing node's page
+    assert f'href="/node/{existing_pro}"' in body
+    # The aliased link gets the visual marker and class
+    assert "aliased-link" in body
+    assert "↗" in body
 
 
 def test_expand_404_for_missing_node(client):
     r = client.post("/node/nonesuch/expand", data={"n_pros": "1", "n_cons": "1"})
     assert r.status_code == 404
+
+
+def test_expand_redirects_with_expanding_query_param(client, state):
+    """/expand returns a 302 with ?expanding=N where N = current_live_count + n_pros + n_cons."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    r = client.post(f"/node/{parent_id}/expand", data={"n_pros": "2", "n_cons": "3"})
+    assert r.status_code == 302
+    assert "expanding=5" in r.headers["Location"]
+
+
+def test_expand_redirect_preserves_sort_when_provided(client, state):
+    """If the form carries sort=newest, the redirect URL keeps it alongside expanding=N."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    r = client.post(
+        f"/node/{parent_id}/expand",
+        data={"n_pros": "1", "n_cons": "1", "sort": "newest"},
+    )
+    assert r.status_code == 302
+    loc = r.headers["Location"]
+    assert "sort=newest" in loc
+    assert "expanding=" in loc
+
+
+def test_expand_redirect_drops_unknown_sort(client, state):
+    """A garbage sort value should silently be dropped from the redirect."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    r = client.post(
+        f"/node/{parent_id}/expand",
+        data={"n_pros": "1", "n_cons": "1", "sort": "garbage"},
+    )
+    assert r.status_code == 302
+    assert "sort=" not in r.headers["Location"]
+
+
+def test_expand_form_includes_current_sort_as_hidden(client, state):
+    """The expand form rendered when viewing with ?sort=newest carries the sort
+    forward as a hidden field so the redirect can preserve it."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    body = client.get(f"/node/{parent_id}?sort=newest").data.decode()
+    assert '<input type="hidden" name="sort" value="newest">' in body
+
+
+def test_expanding_banner_renders_while_count_below_target(client, state):
+    """When the URL says expanding=10 but only 4 children exist, banner + reload script appear."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "2", "n_cons": "2"})
+    # Now there are 4 children; ask the view for ?expanding=10 (more than current)
+    body = client.get(f"/node/{parent_id}?expanding=10").data.decode()
+    assert "expanding-banner" in body
+    assert "generating arguments" in body
+    assert "4 / 10" in body
+    assert "location.reload" in body  # the auto-refresh script
+
+
+def test_no_banner_once_target_reached(client, state):
+    """Once live children count >= expanding total, no visible banner, no polling."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "2", "n_cons": "2"})
+    # 4 children present; ask for ?expanding=4 — already done
+    body = client.get(f"/node/{parent_id}?expanding=4").data.decode()
+    # The VISIBLE banner has the parenthesized count "generating arguments… (X /"
+    # The HIDDEN placeholder has "generating arguments…" without the count parens
+    assert "generating arguments… (" not in body
+    # No 2-second polling reload script
+    assert ", 2000);" not in body
+    # The hidden placeholder IS still rendered in the DOM (for instant visual feedback
+    # on the next expand click) — this is fine.
+
+
+def test_no_banner_without_expanding_param(client, state):
+    """Plain view URL: no visible banner, no polling. The hidden JS-target
+    placeholder is allowed (used by base.html's expand-form handler)."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    body = client.get(f"/node/{parent_id}").data.decode()
+    # No visible banner with count
+    assert "generating arguments… (" not in body
+    # No 2-second polling reload (the JS handler in base.html uses 1500, fine to ignore)
+    assert ", 2000);" not in body
+    # Hidden placeholder banner is pre-rendered for the JS handler to unhide.
+    # The `hidden` attribute must be on the same element as the class so CSS
+    # `.expanding-banner[hidden]` can hide it (otherwise `display: flex` wins).
+    assert 'id="expand-pending-banner"' in body
+    assert 'class="expanding-banner" id="expand-pending-banner" hidden' in body
+
+
+def test_expand_form_has_class_for_js_intercept(client, state):
+    """The expand button form needs `expand-form` class so the JS handler in
+    base.html can intercept its submit and avoid the immediate page refresh."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    body = client.get(f"/node/{parent_id}").data.decode()
+    assert 'expand-form' in body
+
+
+def test_multiple_expand_clicks_chain_more_children(client, state):
+    """Clicking expand twice doubles the children. Second click adds another batch."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "2", "n_cons": "2"})
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "2", "n_cons": "2"})
+    nodes = state.replay()
+    live = [c for c in nodes[parent_id].children
+            if not nodes[c].deleted and nodes[c].merged_into is None]
+    assert len(live) == 8
 
 
 # ---------- delete ----------
@@ -517,7 +773,7 @@ def test_add_child_calls_scorer_and_persists_label(client, state):
 
     # scorer was called with parent text + child text + stance
     assert state.expander.score_calls
-    parent_text, child_text, stance = state.expander.score_calls[0]
+    parent_text, child_text, stance, _ancestors = state.expander.score_calls[0]
     assert parent_text == "parent"
     assert child_text == "user-written con"
     assert stance == "con"
@@ -599,7 +855,7 @@ def test_submit_scores_root_claim(client, state):
     nodes = state.replay()
     root = next(iter(nodes.values()))
     assert root.label == "very strong"
-    assert state.expander.score_claim_calls == ["vaccines are safe"]
+    assert [c[0] for c in state.expander.score_claim_calls] == ["vaccines are safe"]
 
 
 def test_submit_force_new_scores_root(client, state):
@@ -633,7 +889,7 @@ def test_submit_link_negation_scores_root(client, state):
     nodes = state.replay()
     new_root = next(n for n in nodes.values() if n.text == "X is false")
     assert new_root.label == "moderate"
-    assert state.expander.score_claim_calls == ["X is false"]
+    assert [c[0] for c in state.expander.score_claim_calls] == ["X is false"]
 
 
 def test_submit_continues_if_score_claim_raises(client, state):
@@ -685,6 +941,545 @@ def test_index_sorts_roots_by_score_desc(client, state):
 
     body = client.get("/").data.decode()
     assert -1 < body.find("very strong root") < body.find("moderate root") < body.find("weak root")
+
+
+# ---------- context_chain helper + ancestor propagation ----------
+
+def test_context_chain_empty_for_root(state):
+    from app import context_chain, create_root
+    state.expander.score_claim_to_return = "moderate"
+    create_root(state, "the root")
+    nodes = state.replay()
+    root = next(iter(nodes.values()))
+    assert context_chain(root, nodes) == []
+
+
+def test_context_chain_single_step_when_parent_is_self_contained(state):
+    """If the immediate parent is self-contained, chain stops there."""
+    from app import context_chain, create_node, create_root
+    create_root(state, "root claim")
+    nodes = state.replay()
+    root_id = next(iter(nodes))
+    nodes[root_id].containment = "self-contained"  # synthetic — but parent is root anyway
+
+    child_id = create_node(state, "child claim", root_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": child_id,
+                             "containment": "references-parent"})
+    nodes = state.replay()
+    chain = context_chain(nodes[child_id], nodes)
+    # only the root in the chain
+    assert [n.id for n in chain] == [root_id]
+
+
+def test_context_chain_walks_up_through_references_parent(state):
+    """Walks up through ancestors that reference their parent, stops at self-contained."""
+    from app import context_chain, create_node, create_root
+    create_root(state, "root claim")
+    nodes = state.replay()
+    root_id = next(iter(nodes))
+
+    # Build a chain: root -> a (refs-parent) -> b (refs-parent) -> c (refs-parent)
+    a_id = create_node(state, "a", root_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": a_id, "containment": "references-parent"})
+    b_id = create_node(state, "b", a_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": b_id, "containment": "references-parent"})
+    c_id = create_node(state, "c", b_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": c_id, "containment": "references-parent"})
+    nodes = state.replay()
+
+    chain = context_chain(nodes[c_id], nodes)
+    # closest-first: b, a, root (walks up since each is references-parent)
+    assert [n.id for n in chain] == [b_id, a_id, root_id]
+
+
+def test_context_chain_stops_at_first_self_contained_ancestor(state):
+    """Chain terminates as soon as we find a self-contained ancestor."""
+    from app import context_chain, create_node, create_root
+    create_root(state, "root")
+    nodes = state.replay()
+    root_id = next(iter(nodes))
+
+    # root -> a (self-contained) -> b (refs-parent) -> c (refs-parent)
+    a_id = create_node(state, "a", root_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": a_id, "containment": "self-contained"})
+    b_id = create_node(state, "b", a_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": b_id, "containment": "references-parent"})
+    c_id = create_node(state, "c", b_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": c_id, "containment": "references-parent"})
+    nodes = state.replay()
+
+    chain = context_chain(nodes[c_id], nodes)
+    # b's parent a is self-contained, so chain stops at a (root not included)
+    assert [n.id for n in chain] == [b_id, a_id]
+
+
+def test_ancestors_payload_returns_text_stance_tuples(state):
+    from app import ancestors_payload, create_node, create_root
+    create_root(state, "root text")
+    nodes = state.replay()
+    root_id = next(iter(nodes))
+    a_id = create_node(state, "a text", root_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": a_id, "containment": "references-parent"})
+    b_id = create_node(state, "b text", a_id, "con")
+    nodes = state.replay()
+
+    payload = ancestors_payload(nodes[b_id], nodes)
+    assert payload == [("a text", "pro"), ("root text", "root")]
+
+
+def test_score_argument_receives_ancestors_when_parent_references_grandparent(client, state):
+    """add_child should pass the parent's chain to score_argument when the parent
+    isn't self-contained."""
+    from app import create_node, create_root
+    create_root(state, "ROOT")
+    nodes = state.replay()
+    root_id = next(iter(nodes))
+    a_id = create_node(state, "A (mid)", root_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": a_id, "containment": "references-parent"})
+
+    state.expander.score_calls.clear()
+    client.post(f"/node/{a_id}/add_child", data={"text": "child of A", "stance": "pro"})
+
+    # score_argument was called with ancestors = chain of A
+    assert state.expander.score_calls
+    parent_text, child_text, stance, ancestors = state.expander.score_calls[0]
+    assert parent_text == "A (mid)"
+    assert child_text == "child of A"
+    # Chain should include the root
+    assert ("ROOT", "root") in ancestors
+
+
+def test_expand_receives_ancestors_when_expanding_non_root(client, state):
+    """expand_node should pass the parent's chain to Expander.expand."""
+    from app import create_node, create_root
+    create_root(state, "ROOT")
+    nodes = state.replay()
+    root_id = next(iter(nodes))
+    a_id = create_node(state, "A", root_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": a_id, "containment": "references-parent"})
+
+    state.expander.calls.clear()
+    client.post(f"/node/{a_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+
+    assert state.expander.calls
+    _, _, _, _, _, ancestors = state.expander.calls[0]
+    assert ("ROOT", "root") in ancestors
+
+
+def test_score_claim_receives_ancestors_on_first_view_of_nonroot(client, state):
+    """ensure_standalone_score should pass the chain to score_claim."""
+    from app import create_node, create_root
+    create_root(state, "ROOT")
+    nodes = state.replay()
+    root_id = next(iter(nodes))
+    a_id = create_node(state, "A", root_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": a_id, "containment": "references-parent"})
+    # b is a child of a, which references its parent — viewing b should give it
+    # the full chain (a + ROOT) when scoring standalone.
+    b_id = create_node(state, "B", a_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": b_id, "containment": "references-parent"})
+
+    state.expander.score_claim_calls.clear()
+    client.get(f"/node/{b_id}")
+
+    assert state.expander.score_claim_calls
+    claim_text, ancestors = state.expander.score_claim_calls[0]
+    assert claim_text == "B"
+    # chain walks up: A first, then ROOT
+    assert ancestors == [("A", "pro"), ("ROOT", "root")]
+
+
+def test_explain_argument_receives_ancestors(client, state):
+    from app import create_node, create_root
+    create_root(state, "ROOT")
+    nodes = state.replay()
+    root_id = next(iter(nodes))
+    a_id = create_node(state, "A", root_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": a_id, "containment": "references-parent"})
+    b_id = create_node(state, "B", a_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": b_id, "label": "strong"})
+
+    state.expander.explain_argument_calls.clear()
+    client.post(f"/node/{b_id}/explain", data={"axis": "relational"})
+
+    assert state.expander.explain_argument_calls
+    _, _, _, _, ancestors = state.expander.explain_argument_calls[0]
+    assert ("ROOT", "root") in ancestors
+
+
+# ---------- dual-axis scoring: standalone vs relational ----------
+
+def test_view_nonroot_first_time_computes_standalone_score(client, state):
+    """First visit to a non-root's own page should compute its standalone score
+    via score_claim and persist it as standalone_label."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.score_claim_to_return = "moderate"  # what FakeExpander returns for standalone
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    # before the visit, the child has only a relational label (not standalone)
+    assert nodes[child_id].label == "strong"  # FakeExpander expand sets pro=strong
+    assert nodes[child_id].standalone_label is None
+
+    # visit the child's own page
+    state.expander.score_claim_calls.clear()
+    client.get(f"/node/{child_id}")
+    nodes = state.replay()
+
+    # standalone score is now populated; relational label is unchanged
+    assert nodes[child_id].standalone_label == "moderate"
+    assert nodes[child_id].label == "strong"
+    # score_claim was called with the child's text
+    assert state.expander.score_claim_calls[-1][0] == nodes[child_id].text
+
+
+def test_view_nonroot_first_time_runs_self_containment_check(client, state):
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.containment_to_return = ContainmentResult(
+        containment="references-parent", reasoning="uses 'it' to refer to the parent"
+    )
+    client.post("/submit", data={"text": "parent claim"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    state.expander.containment_calls.clear()
+    client.get(f"/node/{child_id}")
+    nodes = state.replay()
+
+    assert nodes[child_id].containment == "references-parent"
+    assert nodes[child_id].containment_reasoning == "uses 'it' to refer to the parent"
+    assert state.expander.containment_calls
+    parent_text, child_text = state.expander.containment_calls[0]
+    assert parent_text == "parent claim"
+    assert child_text == nodes[child_id].text
+
+
+def test_view_nonroot_caches_standalone_score_across_visits(client, state):
+    """Second visit shouldn't re-fire the LLM calls — the result is cached."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    client.get(f"/node/{child_id}")  # first visit: computes
+    score_calls_after_first = len(state.expander.score_claim_calls)
+    sc_calls_after_first = len(state.expander.containment_calls)
+
+    client.get(f"/node/{child_id}")  # second visit: should NOT recompute
+    assert len(state.expander.score_claim_calls) == score_calls_after_first
+    assert len(state.expander.containment_calls) == sc_calls_after_first
+
+
+def test_view_root_does_not_trigger_standalone_score(client, state):
+    """Roots already have a standalone score (their `label`) — no extra call needed."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "the root"})
+    nodes = state.replay()
+    nid = next(iter(nodes))
+    score_calls_before = len(state.expander.score_claim_calls)
+    sc_calls_before = len(state.expander.containment_calls)
+    client.get(f"/node/{nid}")
+    # the root's standalone was already computed at submit; viewing shouldn't add calls
+    assert len(state.expander.score_claim_calls) == score_calls_before
+    assert len(state.expander.containment_calls) == sc_calls_before
+
+
+def test_nonroot_article_shows_standalone_score_badge(client, state):
+    """The article on a non-root's page renders the STANDALONE score, not relational."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.score_claim_to_return = "very weak"  # standalone says: very weak (1)
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    body = client.get(f"/node/{child_id}").data.decode()
+    # FakeExpander.expand gave the child label="strong" (relational, score 4).
+    # Standalone is "very weak" (score 1). The ARTICLE must show 1, not 4.
+    article_section = body.split("<h1>")[0]  # everything before the title
+    assert "score-1" in article_section
+    assert "score-4" not in article_section
+
+
+def test_self_containment_notice_when_not_self_contained(client, state):
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.containment_to_return = ContainmentResult(
+        containment="references-parent", reasoning="needs the parent for context"
+    )
+    client.post("/submit", data={"text": "the parent claim text"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    body = client.get(f"/node/{child_id}").data.decode()
+    assert "context-notice" in body
+    assert "In context of" in body
+    assert "the parent claim text" in body
+    # the disclosure with the LLM's reasoning for the self-containment verdict
+    assert "needs the parent for context" in body
+
+
+def test_no_self_containment_notice_when_self_contained(client, state):
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.containment_to_return = ContainmentResult(
+        containment="self-contained", reasoning="claim names its own subject"
+    )
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    body = client.get(f"/node/{child_id}").data.decode()
+    assert "context-notice" not in body
+
+
+def test_self_contained_pill_visible_when_yes(client, state):
+    """Both states get a visible status pill on the article — the positive case too."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.containment_to_return = ContainmentResult(
+        containment="self-contained", reasoning="names its subject explicitly"
+    )
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    body = client.get(f"/node/{child_id}").data.decode()
+    assert 'class="sc-tag sc-yes"' in body
+    assert ">self-contained<" in body
+    # the LLM's reasoning is exposed via the hover tooltip; suffix tells the user about the click
+    assert 'names its subject explicitly' in body
+    assert 'click to flip' in body
+
+
+def test_self_contained_pill_visible_when_no(client, state):
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.containment_to_return = ContainmentResult(
+        containment="references-parent", reasoning="uses pronouns"
+    )
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    body = client.get(f"/node/{child_id}").data.decode()
+    assert 'class="sc-tag sc-no"' in body
+    assert ">references-parent<" in body
+    # AND the fuller context-notice block also renders for the references-parent case
+    assert "context-notice" in body
+
+
+def test_self_contained_pill_absent_on_root(client, state):
+    """Roots don't have a parent, so self-containment doesn't apply — no pill."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "the root"})
+    nodes = state.replay()
+    nid = next(iter(nodes))
+    body = client.get(f"/node/{nid}").data.decode()
+    assert "sc-tag" not in body
+
+
+# ---------- user-override containment toggle ----------
+
+def test_containment_pill_renders_as_form_button(client, state):
+    """The pill is a submit button posting to /toggle_containment — clicking flips it."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.containment_to_return = ContainmentResult(
+        containment="self-contained", reasoning="ok"
+    )
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    body = client.get(f"/node/{child_id}").data.decode()
+    assert f'/node/{child_id}/toggle_containment' in body
+    # pill is now a submit button styled as the badge
+    assert '<button type="submit" class="sc-tag' in body
+
+
+def test_toggle_containment_flips_self_contained_to_references_parent(client, state):
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.containment_to_return = ContainmentResult(
+        containment="self-contained", reasoning="LLM says yes"
+    )
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+    # populate containment via first view
+    client.get(f"/node/{child_id}")
+    nodes = state.replay()
+    assert nodes[child_id].containment == "self-contained"
+
+    r = client.post(f"/node/{child_id}/toggle_containment")
+    assert r.status_code == 302
+    nodes = state.replay()
+    assert nodes[child_id].containment == "references-parent"
+    # the override carries a marker so future readers can see it was a manual flip
+    assert nodes[child_id].containment_reasoning == "manually set by user"
+
+
+def test_toggle_containment_flips_references_parent_to_self_contained(client, state):
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.containment_to_return = ContainmentResult(
+        containment="references-parent", reasoning="LLM says no"
+    )
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+    client.get(f"/node/{child_id}")
+    nodes = state.replay()
+    assert nodes[child_id].containment == "references-parent"
+
+    client.post(f"/node/{child_id}/toggle_containment")
+    nodes = state.replay()
+    assert nodes[child_id].containment == "self-contained"
+
+
+def test_toggle_containment_redirects_to_referrer(client, state):
+    """The flip should bring the user back to where they clicked from."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+    client.get(f"/node/{child_id}")  # populate containment
+
+    r = client.post(
+        f"/node/{child_id}/toggle_containment",
+        headers={"Referer": f"http://localhost/node/{child_id}"},
+    )
+    assert r.status_code == 302
+    assert f"/node/{child_id}" in r.headers["Location"]
+
+
+def test_toggle_containment_is_400_for_root(client, state):
+    """Roots have no parent → no containment axis → 400 (or some error)."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "the root"})
+    nodes = state.replay()
+    nid = next(iter(nodes))
+    r = client.post(f"/node/{nid}/toggle_containment")
+    assert r.status_code == 400
+
+
+def test_toggle_containment_404_for_missing(client):
+    r = client.post("/node/nonesuch/toggle_containment")
+    assert r.status_code == 404
+
+
+def test_toggle_containment_does_not_re_trigger_llm(client, state):
+    """Manual override should NOT call check_containment again."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+    client.get(f"/node/{child_id}")  # this DOES call check_containment
+    state.expander.containment_calls.clear()
+
+    client.post(f"/node/{child_id}/toggle_containment")
+    # a manual flip is purely user-driven — no LLM call
+    assert state.expander.containment_calls == []
+
+
+# ---------- /explain with axis param ----------
+
+def test_explain_axis_standalone_persists_standalone_reasoning(client, state):
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.explain_claim_to_return = "standalone explanation here"
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+    client.get(f"/node/{child_id}")  # populate standalone_label
+
+    state.expander.explain_claim_calls.clear()
+    state.expander.explain_argument_calls.clear()
+    r = client.post(f"/node/{child_id}/explain", data={"axis": "standalone"})
+    assert r.status_code == 302
+    nodes = state.replay()
+    assert nodes[child_id].standalone_reasoning == "standalone explanation here"
+    # should NOT have written into relational reasoning
+    assert nodes[child_id].reasoning is None
+    # used explain_claim (standalone), not explain_argument
+    assert state.expander.explain_claim_calls
+    assert state.expander.explain_argument_calls == []
+
+
+def test_explain_axis_relational_persists_relational_reasoning(client, state):
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.explain_argument_to_return = "relational explanation here"
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+
+    state.expander.explain_argument_calls.clear()
+    r = client.post(f"/node/{child_id}/explain", data={"axis": "relational"})
+    assert r.status_code == 302
+    nodes = state.replay()
+    assert nodes[child_id].reasoning == "relational explanation here"
+    # should NOT have written into standalone
+    assert nodes[child_id].standalone_reasoning is None
+    assert state.expander.explain_argument_calls
+
+
+def test_pros_cons_list_shows_relational_score_not_standalone(client, state):
+    """In the parent's view, child badges show their RELATIONAL score (label),
+    not the standalone one even if both have been computed."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.score_claim_to_return = "very weak"  # standalone label for any non-root
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    client.post(f"/node/{parent_id}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    child_id = next(iter(nodes[parent_id].children))
+    client.get(f"/node/{child_id}")  # populate standalone fields
+
+    # Now view the PARENT — child's badge in the pros list should show relational (4=strong)
+    body = client.get(f"/node/{parent_id}").data.decode()
+    # The child appears in the parent's pros list with relational label (strong=4)
+    pros_section = body.split("<h3>Pros")[1].split("<h3>")[0] if "<h3>Pros" in body else ""
+    assert "score-4" in pros_section  # relational
+    assert "score-1" not in pros_section  # standalone NOT shown here
 
 
 # ---------- lazy reasoning: not generated at score time, only on /explain ----------
@@ -747,9 +1542,40 @@ def test_node_view_score_badge_is_clickable_when_no_reasoning(client, state):
     # Badge is a <button> styled with the score class
     assert '<button type="submit"' in body
     assert 'class="label score-5"' in body
-    # The score badge itself should NOT be wrapped in a reasoning disclosure yet
-    # (the header score-legend <details> is a different element with class="legend")
+    # No cached reasoning yet — no reasoning panel
     assert 'class="reasoning-box"' not in body
+
+
+def test_no_reasoning_renders_hidden_spinner_placeholder(client, state):
+    """A hidden &lt;div class="why-spinner-pending"&gt; lives below the claim while reasoning
+    is uncached. JS in base.html unhides it on form submit so the user sees a spinner
+    while the LLM generates the explanation."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.score_claim_to_return = "moderate"
+    client.post("/submit", data={"text": "claim"})
+    nodes = state.replay()
+    nid = next(iter(nodes))
+    body = client.get(f"/node/{nid}").data.decode()
+    assert 'class="why-spinner-pending"' in body
+    # element starts hidden via the `hidden` attribute (unhidden by JS on submit)
+    assert 'class="why-spinner-pending" hidden' in body
+    assert "generating reasoning" in body
+
+
+def test_cached_reasoning_replaces_spinner_placeholder(client, state):
+    """Once reasoning is cached, the spinner placeholder is replaced by the real reasoning panel."""
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    state.expander.explain_claim_to_return = "the reason"
+    client.post("/submit", data={"text": "claim"})
+    nodes = state.replay()
+    nid = next(iter(nodes))
+    client.post(f"/node/{nid}/explain")  # populate reasoning
+    body = client.get(f"/node/{nid}").data.decode()
+    # No spinner element rendered — reasoning panel is in its place. (The string
+    # "why-spinner-pending" still appears in the inline JS that handles forms,
+    # so we check for the actual class-attribute substring instead of bare name.)
+    assert 'class="why-spinner-pending"' not in body
+    assert 'class="reasoning-box"' in body
 
 
 def test_index_score_badge_is_clickable_when_no_reasoning(client, state):
@@ -777,7 +1603,7 @@ def test_explain_route_calls_explain_claim_for_root(client, state):
     nodes = state.replay()
     assert nodes[nid].reasoning == "Backed by multiple peer-reviewed studies."
     # must have used explain_claim (not explain_argument) since this is a root
-    assert state.expander.explain_claim_calls == [("vaccines work", "strong")]
+    assert state.expander.explain_claim_calls == [("vaccines work", "strong", [])]
     assert state.expander.explain_argument_calls == []
 
 
@@ -798,7 +1624,7 @@ def test_explain_route_calls_explain_argument_for_child(client, state):
     assert nodes[child_id].reasoning == "Concrete data point with cited source."
     # must have used explain_argument
     assert len(state.expander.explain_argument_calls) == 1
-    parent_text, child_text, stance, label = state.expander.explain_argument_calls[0]
+    parent_text, child_text, stance, label, _ancestors = state.expander.explain_argument_calls[0]
     assert parent_text == "the parent claim"
     assert child_text == child.text
     assert stance == child.stance
@@ -840,7 +1666,8 @@ def test_explain_failure_does_not_overwrite_state(client, state):
 
 
 def test_view_after_explain_renders_disclosure(client, state):
-    """Once /explain runs, the badge becomes the &lt;summary&gt; of a &lt;details&gt; with cached text."""
+    """Once /explain runs, the badge above becomes a checkbox+label toggle, and the
+    reasoning panel renders below the claim. Click the badge to collapse/expand."""
     state.classifier.default = ClassifierResult("new", None, 1.0, "")
     state.expander.explain_claim_to_return = "the cached explanation text"
     client.post("/submit", data={"text": "claim"})
@@ -849,10 +1676,18 @@ def test_view_after_explain_renders_disclosure(client, state):
     client.post(f"/node/{nid}/explain")
     body = client.get(f"/node/{nid}").data.decode()
     assert "the cached explanation text" in body
-    # The score badge is now rendered as <summary class="label score-X">, not as a form button
-    assert '<summary class="label score-' in body
-    assert f'/node/{nid}/explain' not in body  # no form posting to /explain for this root anymore
-    assert '<button type="submit" class="label' not in body  # no badge-as-button
+    # Toggle pair: hidden checkbox (default checked, so panel starts visible) + label
+    assert 'class="reason-toggle"' in body
+    assert 'type="checkbox"' in body
+    assert "checked" in body
+    assert 'class="label score-' in body  # the visible badge label
+    # No form action to /explain (reasoning is cached) and no submit button-as-badge
+    assert f'/node/{nid}/explain' not in body
+    assert '<button type="submit" class="label' not in body
+    # Reasoning panel below the claim is a div, no longer a <details>
+    assert 'class="reasoning-box"' in body
+    assert 'class="reasoning-title"' in body
+    assert 'class="reasoning-text"' in body
 
 
 def test_explain_redirects_back_to_referrer(client, state):
@@ -883,6 +1718,97 @@ def test_node_view_renders_add_child_form(client, state):
     assert "Add as Pro" in body
     assert "Add as Con" in body
     assert "/add_child" in body
+
+
+# ---------- sort options ----------
+
+def test_sort_controls_present_with_score_active_by_default(client, state):
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    body = client.get(f"/node/{parent_id}").data.decode()
+    assert 'class="sort-controls"' in body
+    # all three options present, with "score" marked active by default
+    for opt in ("score", "newest", "oldest"):
+        assert f'sort={opt}' in body
+    assert '?sort=score" class="active"' in body or "score</a>" in body  # score is the active link
+
+
+def test_sort_by_newest_orders_recent_first(client, state):
+    """?sort=newest → most-recently-created child first."""
+    from app import create_node
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    # Create three pros in order; later-created ones have higher created_at
+    a = create_node(state, "first pro", parent_id, "pro")
+    b = create_node(state, "second pro", parent_id, "pro")
+    c = create_node(state, "third pro", parent_id, "pro")
+    body = client.get(f"/node/{parent_id}?sort=newest").data.decode()
+    # Newest first: third, second, first
+    assert -1 < body.find("third pro") < body.find("second pro") < body.find("first pro")
+
+
+def test_sort_by_oldest_orders_oldest_first(client, state):
+    from app import create_node
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    a = create_node(state, "first pro", parent_id, "pro")
+    b = create_node(state, "second pro", parent_id, "pro")
+    c = create_node(state, "third pro", parent_id, "pro")
+    body = client.get(f"/node/{parent_id}?sort=oldest").data.decode()
+    assert -1 < body.find("first pro") < body.find("second pro") < body.find("third pro")
+
+
+def test_sort_by_score_overrides_creation_order(client, state):
+    """Score sort: highest-rated first regardless of creation time."""
+    from app import create_node
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    weak = create_node(state, "older weak pro", parent_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": weak, "label": "weak"})
+    strong = create_node(state, "newer strong pro", parent_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": strong, "label": "very strong"})
+    # default sort = score: very strong appears first despite being newer
+    body = client.get(f"/node/{parent_id}").data.decode()
+    assert -1 < body.find("newer strong pro") < body.find("older weak pro")
+
+
+def test_invalid_sort_falls_back_to_score(client, state):
+    """A garbage sort value shouldn't error or change the order — falls back to score."""
+    from app import create_node
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    weak = create_node(state, "weak pro", parent_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": weak, "label": "weak"})
+    strong = create_node(state, "strong pro", parent_id, "pro")
+    state.event_log.append({"t": "node_scored", "id": strong, "label": "very strong"})
+    r = client.get(f"/node/{parent_id}?sort=garbage")
+    assert r.status_code == 200
+    body = r.data.decode()
+    # falls back to score: strong before weak
+    assert body.find("strong pro") < body.find("weak pro")
+
+
+def test_sort_applies_to_cons_too(client, state):
+    """Both pros and cons honor the requested sort independently."""
+    from app import create_node
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    client.post("/submit", data={"text": "parent"})
+    nodes = state.replay()
+    parent_id = next(iter(nodes))
+    create_node(state, "old con", parent_id, "con")
+    create_node(state, "new con", parent_id, "con")
+    body = client.get(f"/node/{parent_id}?sort=newest").data.decode()
+    assert body.find("new con") < body.find("old con")
 
 
 def test_unlabeled_children_sort_after_labeled(client, state):

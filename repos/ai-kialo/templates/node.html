@@ -10,21 +10,66 @@
 
 <article class="claim claim-{{ node.stance }}">
   <span class="stance-tag">{{ node.stance }}</span>
-  {% set s = label_score(node.label) %}
+  {% set is_root = node.parent_id is none %}
+  {% if not is_root and node.containment %}
+    {# Inline status pill — visible on every non-root article, for both labels.
+       Click flips the value (manual override of the LLM's judgement). Hover
+       tooltip carries the LLM's reasoning + a hint about the click action. #}
+    {%- set sc_class = 'sc-yes' if node.containment == 'self-contained' else 'sc-no' -%}
+    {%- set sc_title = (node.containment_reasoning ~ ' — click to flip') if node.containment_reasoning else 'click to flip' -%}
+    <form action="{{ url_for('toggle_containment_route', nid=node.id) }}" method="post" class="sc-toggle-form">
+      <button type="submit" class="sc-tag {{ sc_class }}" title="{{ sc_title }}">{{ node.containment }}</button>
+    </form>
+  {% endif %}
+  {# Score badge stays ABOVE the claim. Two modes:
+       - No cached reasoning yet: badge is a submit button in a form; click → /explain
+       - Reasoning cached: badge is just a styled span (no longer the disclosure summary)
+     The reasoning panel is a SEPARATE block below the claim. #}
+  {% set art_label = node.label if is_root else node.standalone_label %}
+  {% set art_reasoning = node.reasoning if is_root else node.standalone_reasoning %}
+  {% set s = label_score(art_label) %}
   {% if s %}
-    {% if node.reasoning %}
-      <details class="reasoning-box" open>
-        <summary class="label score-{{ s }}" title="{{ node.label }}"><span class="badge-num">{{ s }}</span><span class="badge-eq"> = {{ node.label }}</span></summary>
-        <p>{{ node.reasoning }}</p>
-        {% include "_score_legend.html" %}
-      </details>
+    {% if art_reasoning %}
+      {# Reasoning cached — checkbox+label pair; the reasoning-box sibling below
+         is shown/hidden via CSS based on the checkbox state. Defaults to checked
+         (panel visible) so the user sees the reasoning on initial render; click
+         the badge to collapse it. #}
+      <input type="checkbox" id="rt-{{ node.id }}" class="reason-toggle" checked>
+      <label for="rt-{{ node.id }}" class="label score-{{ s }}" title="{{ art_label }} — click to collapse/expand explanation">{{ s }}</label>
     {% else %}
       <form action="{{ url_for('explain_route', nid=node.id) }}" method="post" class="why-form">
-        <button type="submit" class="label score-{{ s }}" title="{{ node.label }} — click for an explanation">{{ s }}</button>
+        <input type="hidden" name="axis" value="standalone">
+        <button type="submit" class="label score-{{ s }}" title="{{ art_label }} — click for an explanation">{{ s }}</button>
       </form>
     {% endif %}
   {% endif %}
   <h1>{{ node.text }}</h1>
+  {% if s and art_reasoning %}
+    <div class="reasoning-box">
+      <p class="reasoning-title">Why <span class="label score-{{ s }}" title="{{ art_label }}">{{ s }}</span> = <strong>{{ art_label }}</strong>?</p>
+      <p class="reasoning-text">{{ art_reasoning }}</p>
+      {% include "_score_legend.html" %}
+    </div>
+  {% elif s %}
+    {# Reasoning not cached yet — spinner placeholder revealed by JS in base.html
+       when the badge form is submitted. #}
+    <div class="why-spinner-pending" hidden>
+      <span class="spinner"></span>
+      <span>generating reasoning…</span>
+    </div>
+  {% endif %}
+  {% if not is_root and node.containment == 'references-parent' and parent %}
+    <aside class="context-notice">
+      <span class="context-tag">In context of:</span>
+      <a href="{{ url_for('view_node', nid=parent.id) }}">{{ parent.text }}</a>
+      {% if node.containment_reasoning %}
+        <details class="context-why">
+          <summary>why context matters here</summary>
+          <p>{{ node.containment_reasoning }}</p>
+        </details>
+      {% endif %}
+    </aside>
+  {% endif %}
   {% if node.conv is not none %}
     <p class="meta">conv {{ "%.2f" | format(node.conv) }}{% if node.uncert is not none %} · uncert {{ "%.2f" | format(node.uncert) }}{% endif %}</p>
   {% endif %}
@@ -41,6 +86,41 @@
 </section>
 {% endif %}
 
+<form action="{{ url_for('expand', nid=node.id) }}" method="post" class="inline expand-form expand-top">
+  <input type="hidden" name="n_pros" value="2">
+  <input type="hidden" name="n_cons" value="2">
+  {# Carry the current sort through the redirect so the polling reload doesn't
+     bounce the user back to the default ordering. #}
+  <input type="hidden" name="sort" value="{{ sort_by }}">
+  <button type="submit">Expand (2 pros + 2 cons)</button>
+</form>
+
+{% if is_expanding %}
+  <div class="expanding-banner">
+    <span class="spinner"></span>
+    <span>generating arguments… ({{ live_children_count }} / {{ expanding_total }})</span>
+  </div>
+  {# Tiny script: re-fetch the page every 2s while expanding. The script is only
+     emitted in this branch, so once is_expanding is False the auto-refresh stops. #}
+  <script>setTimeout(function () { location.reload(); }, 2000);</script>
+{% else %}
+  {# Pre-rendered hidden banner — JS in base.html unhides this immediately on
+     expand-form submit so the user sees feedback without waiting for a page
+     refresh. After ~1.5s the page reloads to the ?expanding=N URL and the
+     server-rendered banner above takes over. #}
+  <div class="expanding-banner" id="expand-pending-banner" hidden>
+    <span class="spinner"></span>
+    <span>generating arguments…</span>
+  </div>
+{% endif %}
+
+<nav class="sort-controls" aria-label="Sort children by">
+  Sort:
+  <a href="{{ url_for('view_node', nid=node.id, sort='score') }}"{% if sort_by == 'score' %} class="active" aria-current="true"{% endif %}>score</a> ·
+  <a href="{{ url_for('view_node', nid=node.id, sort='newest') }}"{% if sort_by == 'newest' %} class="active" aria-current="true"{% endif %}>newest</a> ·
+  <a href="{{ url_for('view_node', nid=node.id, sort='oldest') }}"{% if sort_by == 'oldest' %} class="active" aria-current="true"{% endif %}>oldest</a>
+</nav>
+
 <section class="pros-cons">
   <div class="col col-pros">
     <h3>Pros ({{ pros | length }})</h3>
@@ -51,18 +131,28 @@
             {% set s = label_score(p.label) %}
             {% if s %}
               {% if p.reasoning %}
-                <details class="reasoning-box" open>
-                  <summary class="label score-{{ s }}" title="{{ p.label }}"><span class="badge-num">{{ s }}</span><span class="badge-eq"> = {{ p.label }}</span></summary>
-                  <p>{{ p.reasoning }}</p>
-                  {% include "_score_legend.html" %}
-                </details>
+                <input type="checkbox" id="rt-{{ p.id }}" class="reason-toggle" checked>
+                <label for="rt-{{ p.id }}" class="label score-{{ s }}" title="{{ p.label }} — click to collapse/expand explanation">{{ s }}</label>
               {% else %}
                 <form action="{{ url_for('explain_route', nid=p.id) }}" method="post" class="why-form">
+                  <input type="hidden" name="axis" value="relational">
                   <button type="submit" class="label score-{{ s }}" title="{{ p.label }} — click for an explanation">{{ s }}</button>
                 </form>
               {% endif %}
             {% endif %}
-            <a href="{{ url_for('view_node', nid=p.id) }}">{{ p.text }}</a>
+            <a href="{{ url_for('view_node', nid=p.id) }}"{% if p.parent_id != node.id %} title="linked from elsewhere in the tree" class="aliased-link"{% endif %}>{{ p.text }}{% if p.parent_id != node.id %} <span class="alias-mark" aria-label="linked elsewhere">↗</span>{% endif %}</a>
+            {% if s and p.reasoning %}
+              <div class="reasoning-box">
+                <p class="reasoning-title">Why <span class="label score-{{ s }}" title="{{ p.label }}">{{ s }}</span> = <strong>{{ p.label }}</strong>?</p>
+                <p class="reasoning-text">{{ p.reasoning }}</p>
+                {% include "_score_legend.html" %}
+              </div>
+            {% elif s %}
+              <div class="why-spinner-pending" hidden>
+                <span class="spinner"></span>
+                <span>generating reasoning…</span>
+              </div>
+            {% endif %}
           </li>
         {% endfor %}
       </ul>
@@ -80,18 +170,28 @@
             {% set s = label_score(c.label) %}
             {% if s %}
               {% if c.reasoning %}
-                <details class="reasoning-box" open>
-                  <summary class="label score-{{ s }}" title="{{ c.label }}"><span class="badge-num">{{ s }}</span><span class="badge-eq"> = {{ c.label }}</span></summary>
-                  <p>{{ c.reasoning }}</p>
-                  {% include "_score_legend.html" %}
-                </details>
+                <input type="checkbox" id="rt-{{ c.id }}" class="reason-toggle" checked>
+                <label for="rt-{{ c.id }}" class="label score-{{ s }}" title="{{ c.label }} — click to collapse/expand explanation">{{ s }}</label>
               {% else %}
                 <form action="{{ url_for('explain_route', nid=c.id) }}" method="post" class="why-form">
+                  <input type="hidden" name="axis" value="relational">
                   <button type="submit" class="label score-{{ s }}" title="{{ c.label }} — click for an explanation">{{ s }}</button>
                 </form>
               {% endif %}
             {% endif %}
-            <a href="{{ url_for('view_node', nid=c.id) }}">{{ c.text }}</a>
+            <a href="{{ url_for('view_node', nid=c.id) }}"{% if c.parent_id != node.id %} title="linked from elsewhere in the tree" class="aliased-link"{% endif %}>{{ c.text }}{% if c.parent_id != node.id %} <span class="alias-mark" aria-label="linked elsewhere">↗</span>{% endif %}</a>
+            {% if s and c.reasoning %}
+              <div class="reasoning-box">
+                <p class="reasoning-title">Why <span class="label score-{{ s }}" title="{{ c.label }}">{{ s }}</span> = <strong>{{ c.label }}</strong>?</p>
+                <p class="reasoning-text">{{ c.reasoning }}</p>
+                {% include "_score_legend.html" %}
+              </div>
+            {% elif s %}
+              <div class="why-spinner-pending" hidden>
+                <span class="spinner"></span>
+                <span>generating reasoning…</span>
+              </div>
+            {% endif %}
           </li>
         {% endfor %}
       </ul>
@@ -113,12 +213,6 @@
 </section>
 
 <section class="actions">
-  <form action="{{ url_for('expand', nid=node.id) }}" method="post" class="inline">
-    <input type="hidden" name="n_pros" value="2">
-    <input type="hidden" name="n_cons" value="2">
-    <button type="submit">Expand (2 pros + 2 cons)</button>
-  </form>
-
   <form action="{{ url_for('delete', nid=node.id) }}" method="post" class="inline" onsubmit="return confirm('Delete this claim?');">
     <button type="submit" class="danger">Delete</button>
   </form>

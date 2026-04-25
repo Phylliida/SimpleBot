@@ -19,11 +19,8 @@
           {% set s = label_score(n.label) %}
           {% if s %}
             {% if n.reasoning %}
-              <details class="reasoning-box" open>
-                <summary class="label score-{{ s }}" title="{{ n.label }}"><span class="badge-num">{{ s }}</span><span class="badge-eq"> = {{ n.label }}</span></summary>
-                <p>{{ n.reasoning }}</p>
-                {% include "_score_legend.html" %}
-              </details>
+              <input type="checkbox" id="rt-{{ n.id }}" class="reason-toggle" checked>
+              <label for="rt-{{ n.id }}" class="label score-{{ s }}" title="{{ n.label }} — click to collapse/expand explanation">{{ s }}</label>
             {% else %}
               <form action="{{ url_for('explain_route', nid=n.id) }}" method="post" class="why-form">
                 <button type="submit" class="label score-{{ s }}" title="{{ n.label }} — click for an explanation">{{ s }}</button>
@@ -32,6 +29,18 @@
           {% endif %}
           <a href="{{ url_for('view_node', nid=n.id) }}">{{ n.text }}</a>
           {% if n.children %}<span class="meta">· {{ n.children | length }} children</span>{% endif %}
+          {% if s and n.reasoning %}
+            <div class="reasoning-box">
+              <p class="reasoning-title">Why <span class="label score-{{ s }}" title="{{ n.label }}">{{ s }}</span> = <strong>{{ n.label }}</strong>?</p>
+              <p class="reasoning-text">{{ n.reasoning }}</p>
+              {% include "_score_legend.html" %}
+            </div>
+          {% elif s %}
+            <div class="why-spinner-pending" hidden>
+              <span class="spinner"></span>
+              <span>generating reasoning…</span>
+            </div>
+          {% endif %}
         </li>
       {% endfor %}
     </ul>

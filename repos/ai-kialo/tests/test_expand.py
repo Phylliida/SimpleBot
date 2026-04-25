@@ -18,18 +18,25 @@ from expand import (
     LABEL_TO_SCORE,
     LABELS,
     _CLAIM_SCORE_SYSTEM_PROMPT,
+    _CON_SCORE_SYSTEM_PROMPT,
     _EXPLAIN_ARG_SYSTEM_PROMPT,
     _EXPLAIN_CLAIM_SYSTEM_PROMPT,
     _EXPLAIN_SCHEMA,
+    _PRO_SCORE_SYSTEM_PROMPT,
     _SCORE_SCHEMA,
-    _SCORE_SYSTEM_PROMPT,
+    _CONTAINMENT_SCHEMA,
+    _CONTAINMENT_SYSTEM_PROMPT,
     _SYSTEM_PROMPT,
+    CONTAINMENT_LABELS,
+    ContainmentResult,
     GeneratedChild,
     LlamaCppExpander,
     _build_claim_score_user_message,
+    _build_containment_message,
+    _build_con_score_message,
     _build_explain_arg_message,
     _build_explain_claim_message,
-    _build_score_user_message,
+    _build_pro_score_message,
     _build_user_message,
     _make_schema,
     _to_child,
@@ -192,21 +199,85 @@ def test_build_explain_claim_message_includes_inputs():
     assert "very strong" in msg
 
 
-def test_score_system_prompt_lists_all_labels():
+def test_pro_score_system_prompt_lists_all_labels():
     for label in LABELS:
-        assert label in _SCORE_SYSTEM_PROMPT
+        assert label in _PRO_SCORE_SYSTEM_PROMPT
 
 
-def test_build_score_user_message_pro_phrasing():
-    msg = _build_score_user_message("Climate change is a problem.", "Sea levels are rising.", "pro")
+def test_con_score_system_prompt_lists_all_labels():
+    for label in LABELS:
+        assert label in _CON_SCORE_SYSTEM_PROMPT
+
+
+def test_pro_score_prompt_focuses_on_supporting():
+    """The pro-only prompt should talk about supporting the parent, not undermining it."""
+    p = _PRO_SCORE_SYSTEM_PROMPT.lower()
+    assert "support" in p
+    assert "toward" in p
+
+
+def test_con_score_prompt_focuses_on_undermining():
+    p = _CON_SCORE_SYSTEM_PROMPT.lower()
+    assert "undermin" in p or "against" in p
+    assert "away" in p
+
+
+def test_build_pro_score_message_phrasing():
+    msg = _build_pro_score_message("Climate change is a problem.", "Sea levels are rising.")
     assert "Climate change is a problem." in msg
     assert "Sea levels are rising." in msg
-    assert "supports" in msg or "pro of" in msg
+    assert "Pro:" in msg
+    assert "supports" in msg.lower()
 
 
-def test_build_score_user_message_con_phrasing():
-    msg = _build_score_user_message("X is good.", "X is harmful.", "con")
-    assert "argues against" in msg or "con of" in msg
+def test_build_con_score_message_phrasing():
+    msg = _build_con_score_message("X is good.", "X is harmful.")
+    assert "X is good." in msg
+    assert "X is harmful." in msg
+    assert "Con:" in msg
+    assert "undermin" in msg.lower()
+
+
+# ---------- containment schema + prompt ----------
+
+def test_containment_schema_required_fields():
+    s = _CONTAINMENT_SCHEMA["schema"]
+    assert _CONTAINMENT_SCHEMA["strict"] is True
+    assert s["additionalProperties"] is False
+    assert set(s["required"]) == {"reasoning", "containment"}
+    assert s["properties"]["containment"]["type"] == "string"
+    assert s["properties"]["containment"]["enum"] == list(CONTAINMENT_LABELS)
+
+
+def test_containment_schema_field_order_reasoning_first():
+    """CoT-first ordering: reasoning emits before the label commits."""
+    keys = list(_CONTAINMENT_SCHEMA["schema"]["properties"].keys())
+    assert keys.index("reasoning") < keys.index("containment")
+
+
+def test_containment_labels_are_two():
+    assert set(CONTAINMENT_LABELS) == {"self-contained", "references-parent"}
+
+
+def test_containment_prompt_lists_both_labels():
+    p = _CONTAINMENT_SYSTEM_PROMPT
+    assert "self-contained" in p
+    assert "references-parent" in p
+
+
+def test_containment_prompt_has_examples():
+    """Prompt should include concrete examples to anchor the rule."""
+    p = _CONTAINMENT_SYSTEM_PROMPT.lower()
+    assert "example" in p
+    # the canonical bad case (a pronoun referring to the parent)
+    assert "it" in p
+
+
+def test_build_containment_message_includes_both_claims():
+    msg = _build_containment_message("Renewable energy is the future.", "It reduces emissions.")
+    assert "Renewable energy is the future." in msg
+    assert "It reduces emissions." in msg
+    assert "self-contained" in msg or "references-parent" in msg
 
 
 # ---------- LlamaCppExpander.score_argument: argument validation ----------
