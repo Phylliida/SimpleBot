@@ -86,6 +86,18 @@
 </section>
 {% endif %}
 
+{% if potential_dupes %}
+<section class="potential-dupes">
+  <h3>Potential duplicates</h3>
+  <p class="meta">Other claims in the tree that look similar to this one (false positives are common — these are suggestions only).</p>
+  <ul class="claim-list">
+    {% for d in potential_dupes %}
+      <li><a href="{{ url_for('view_node', nid=d.id) }}">{{ d.text }}</a></li>
+    {% endfor %}
+  </ul>
+</section>
+{% endif %}
+
 <form action="{{ url_for('expand', nid=node.id) }}" method="post" class="inline expand-form expand-top">
   <input type="hidden" name="n_pros" value="2">
   <input type="hidden" name="n_cons" value="2">
@@ -140,7 +152,7 @@
                 </form>
               {% endif %}
             {% endif %}
-            <a href="{{ url_for('view_node', nid=p.id) }}"{% if p.parent_id != node.id %} title="linked from elsewhere in the tree" class="aliased-link"{% endif %}>{{ p.text }}{% if p.parent_id != node.id %} <span class="alias-mark" aria-label="linked elsewhere">↗</span>{% endif %}</a>
+            <a href="{{ url_for('view_node', nid=p.id) }}">{{ p.text }}</a>{% if p.potential_dupes %}<sup class="dupe-links">{% for d in p.potential_dupes %}{% if d in nodes_by_id and not nodes_by_id[d].deleted %}<a href="{{ url_for('view_node', nid=d) }}" class="dupe-link" title="potential duplicate: {{ nodes_by_id[d].text }}">{{ loop.index }}</a>{% if not loop.last %},{% endif %}{% endif %}{% endfor %}</sup>{% endif %}
             {% if s and p.reasoning %}
               <div class="reasoning-box">
                 <p class="reasoning-title">Why <span class="label score-{{ s }}" title="{{ p.label }}">{{ s }}</span> = <strong>{{ p.label }}</strong>?</p>
@@ -179,7 +191,7 @@
                 </form>
               {% endif %}
             {% endif %}
-            <a href="{{ url_for('view_node', nid=c.id) }}"{% if c.parent_id != node.id %} title="linked from elsewhere in the tree" class="aliased-link"{% endif %}>{{ c.text }}{% if c.parent_id != node.id %} <span class="alias-mark" aria-label="linked elsewhere">↗</span>{% endif %}</a>
+            <a href="{{ url_for('view_node', nid=c.id) }}">{{ c.text }}</a>{% if c.potential_dupes %}<sup class="dupe-links">{% for d in c.potential_dupes %}{% if d in nodes_by_id and not nodes_by_id[d].deleted %}<a href="{{ url_for('view_node', nid=d) }}" class="dupe-link" title="potential duplicate: {{ nodes_by_id[d].text }}">{{ loop.index }}</a>{% if not loop.last %},{% endif %}{% endif %}{% endfor %}</sup>{% endif %}
             {% if s and c.reasoning %}
               <div class="reasoning-box">
                 <p class="reasoning-title">Why <span class="label score-{{ s }}" title="{{ c.label }}">{{ s }}</span> = <strong>{{ c.label }}</strong>?</p>

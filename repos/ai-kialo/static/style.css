@@ -260,15 +260,25 @@ button.sc-tag:hover { filter: brightness(1.07); }
 /* Expand button moved up: visual breathing room above the pros/cons grid. */
 .expand-top { margin: 0.6rem 0 1rem; }
 
-/* Aliased child link — small ↗ marker so the user knows clicking takes them
-   elsewhere in the tree (the existing dedup'd node, not a fresh page). */
-.alias-mark {
-  font-size: 0.85em;
-  color: var(--muted);
+/* Superscript "potential duplicate" links rendered after a child claim's text.
+   ¹²³ links — each goes to a similar existing node so the user can compare. */
+.dupe-links {
+  font-size: 0.7em;
   margin-left: 0.15em;
-  vertical-align: 0.15em;
 }
-.aliased-link:hover .alias-mark { color: var(--accent); }
+.dupe-link {
+  color: var(--muted);
+  text-decoration: none;
+  padding: 0 0.15em;
+}
+.dupe-link:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+
+/* Article-level "Potential duplicates" section — shown when the displayed
+   claim has any same-stance similar nodes recorded during expansion. */
+.potential-dupes h3 { color: var(--muted); }
 
 /* Sort-by-score/newest/oldest controls above the pros/cons grid. */
 .sort-controls {

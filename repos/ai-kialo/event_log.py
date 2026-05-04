@@ -53,10 +53,11 @@ class Node:
     deleted: bool = False
     merged_into: str | None = None
     negates: set[str] = field(default_factory=set)
-    # IDs of *additional* parents this node appears under via `node_aliased` events
-    # (used by expansion-time dedup so generated children that match an existing
-    # node are linked to it rather than duplicated).
-    aliased_in: list[str] = field(default_factory=list)
+    # Other live nodes that are semantically similar to this one (informational).
+    # Populated by `node_potential_dupe` events during expansion-time dedup —
+    # rendered as superscript links so the user can compare without losing the
+    # generated claim itself.
+    potential_dupes: list[str] = field(default_factory=list)
     children: list[str] = field(default_factory=list)
 
 
@@ -141,12 +142,12 @@ def _apply(nodes: dict[str, Node], ev: dict) -> None:
     elif t == "node_negates":
         nodes[ev["a"]].negates.add(ev["b"])
         nodes[ev["b"]].negates.add(ev["a"])
-    elif t == "node_aliased":
-        # Adds an extra parent→child edge without creating a new node.
-        # The child appears in the new parent's children list during _rebuild_children.
-        child = nodes.get(ev["child"])
-        if child is not None and ev["parent"] not in child.aliased_in:
-            child.aliased_in.append(ev["parent"])
+    elif t == "node_potential_dupe":
+        # Records that node `id` looks similar to existing node `dupe_of`.
+        # Pure suggestion — the new node still exists in its own right.
+        n = nodes.get(ev["id"])
+        if n is not None and ev["dupe_of"] not in n.potential_dupes:
+            n.potential_dupes.append(ev["dupe_of"])
     elif t == "focus_set":
         pass  # session-scoped; handled outside the node fold
     else:
@@ -156,21 +157,12 @@ def _apply(nodes: dict[str, Node], ev: dict) -> None:
 def _rebuild_children(nodes: dict[str, Node]) -> None:
     for n in nodes.values():
         n.children = []
-    # Real children: parent_id → child
     for n in nodes.values():
         if n.parent_id is None or n.deleted or n.merged_into is not None:
             continue
         parent = nodes.get(n.parent_id)
         if parent is not None:
             parent.children.append(n.id)
-    # Aliased children: each `aliased_in` entry adds an extra parent→child edge
-    for n in nodes.values():
-        if n.deleted or n.merged_into is not None:
-            continue
-        for extra_parent in n.aliased_in:
-            parent = nodes.get(extra_parent)
-            if parent is not None and n.id not in parent.children:
-                parent.children.append(n.id)
 
 
 def resolve(nodes: dict[str, Node], nid: str) -> Node | None:

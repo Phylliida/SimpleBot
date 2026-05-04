@@ -406,14 +406,13 @@ def test_reexpand_excludes_deleted_children_from_existing(client, state):
     assert nodes[pros[1]].text in existing_pros
 
 
-def test_expand_dedups_via_alias_when_match_found(client, state):
+def test_expand_records_potential_dupes_when_match_found(client, state):
     """When a generated child is similar enough to an existing same-stance node,
-    /expand emits a node_aliased event linking the existing node as a child of
-    the new parent — instead of creating a duplicate."""
+    /expand still creates the new node but emits node_potential_dupe events
+    linking back to the candidates."""
     from app import create_node, create_root
 
     state.classifier.default = ClassifierResult("new", None, 1.0, "")
-    # Create two roots and an existing pro under the first
     create_root(state, "Should we adopt renewable energy?")
     nodes = state.replay()
     root_a = next(iter(nodes))
@@ -424,32 +423,23 @@ def test_expand_dedups_via_alias_when_match_found(client, state):
     existing_pro_text = "Renewable energy reduces greenhouse gas emissions"
     existing_pro = create_node(state, existing_pro_text, root_a, "pro")
 
-    # Configure the FakeExpander to return a near-duplicate text for root B's expand
     state.expander.children_to_return = [
         GeneratedChild(text=existing_pro_text, stance="pro", label="strong"),
     ]
     client.post(f"/node/{root_b}/expand", data={"n_pros": "1", "n_cons": "0"})
-
     nodes = state.replay()
-    # No new pro was created under root_b; instead the existing pro is aliased in
-    new_nodes_under_b = [
-        c for c in nodes[root_b].children
-        if c == existing_pro
-    ]
-    assert existing_pro in nodes[root_b].children, "existing pro should be aliased under root_b"
-    # The original pro is still under root_a too
-    assert existing_pro in nodes[root_a].children
-    # The aliased_in list reflects the new parent
-    assert root_b in nodes[existing_pro].aliased_in
-    # No new node with that text was created (the only node with this text is the original)
-    matches = [n for n in nodes.values() if n.text == existing_pro_text]
-    assert len(matches) == 1
-    assert matches[0].id == existing_pro
+
+    # A NEW node was created under root_b (the user-generated claim is preserved)
+    new_pros = [n for n in nodes.values() if n.parent_id == root_b and n.stance == "pro"]
+    assert len(new_pros) == 1
+    new_pro = new_pros[0]
+    assert new_pro.text == existing_pro_text
+    # And it has the existing one recorded as a potential dupe
+    assert existing_pro in new_pro.potential_dupes
 
 
-def test_expand_no_dedup_when_text_dissimilar(client, state):
-    """If the generated text isn't close to any existing node, expand creates a
-    fresh node as normal — no alias."""
+def test_expand_no_potential_dupes_when_text_dissimilar(client, state):
+    """Unrelated text → no potential_dupe events emitted."""
     from app import create_node, create_root
 
     state.classifier.default = ClassifierResult("new", None, 1.0, "")
@@ -458,21 +448,17 @@ def test_expand_no_dedup_when_text_dissimilar(client, state):
     root = next(iter(nodes))
     create_node(state, "Electric motors are efficient", root, "pro")
 
-    # Generate something semantically unrelated → should create a new node, not alias
     state.expander.children_to_return = [
         GeneratedChild(text="Cookies taste good with milk", stance="pro", label="weak"),
     ]
     client.post(f"/node/{root}/expand", data={"n_pros": "1", "n_cons": "0"})
     nodes = state.replay()
-    # New node was created under root with the new text
-    new_nodes = [n for n in nodes.values() if n.text == "Cookies taste good with milk"]
-    assert len(new_nodes) == 1
-    assert new_nodes[0].parent_id == root
+    new_pro = next(n for n in nodes.values() if n.text == "Cookies taste good with milk")
+    assert new_pro.potential_dupes == []
 
 
-def test_aliased_child_renders_with_link_to_existing_node(client, state):
-    """The aliased child appears in the new parent's pros list with a link to
-    the existing node's page (not a new page)."""
+def test_potential_dupes_render_as_superscript_links(client, state):
+    """The pros/cons list shows ¹²³ superscript links pointing at each candidate."""
     from app import create_node, create_root
 
     state.classifier.default = ClassifierResult("new", None, 1.0, "")
@@ -482,20 +468,50 @@ def test_aliased_child_renders_with_link_to_existing_node(client, state):
     create_root(state, "Second root")
     nodes = state.replay()
     root_b = next(rid for rid in nodes if rid != root_a)
-    existing_pro_text = "shared argument across both roots"
-    existing_pro = create_node(state, existing_pro_text, root_a, "pro")
+    shared_text = "shared argument across both roots"
+    existing_pro = create_node(state, shared_text, root_a, "pro")
 
     state.expander.children_to_return = [
-        GeneratedChild(text=existing_pro_text, stance="pro", label="strong"),
+        GeneratedChild(text=shared_text, stance="pro", label="strong"),
     ]
     client.post(f"/node/{root_b}/expand", data={"n_pros": "1", "n_cons": "0"})
 
     body = client.get(f"/node/{root_b}").data.decode()
-    # Link href points at the existing node's page
+    # The new node still appears under root_b (not aliased away)
+    nodes = state.replay()
+    new_pro = next(n for n in nodes.values() if n.parent_id == root_b and n.stance == "pro")
+    assert f'href="/node/{new_pro.id}"' in body
+    # And there's a superscript dupe-link pointing at the existing one
+    assert "dupe-links" in body
+    assert "dupe-link" in body
     assert f'href="/node/{existing_pro}"' in body
-    # The aliased link gets the visual marker and class
-    assert "aliased-link" in body
-    assert "↗" in body
+
+
+def test_article_shows_potential_dupes_section_when_present(client, state):
+    """A node with potential_dupes recorded surfaces them in a dedicated section
+    on its own page so the user can review/compare."""
+    from app import create_node, create_root
+
+    state.classifier.default = ClassifierResult("new", None, 1.0, "")
+    create_root(state, "Root A")
+    nodes = state.replay()
+    root_a = next(iter(nodes))
+    existing_pro = create_node(state, "the canonical claim", root_a, "pro")
+
+    create_root(state, "Root B")
+    nodes = state.replay()
+    root_b = next(rid for rid in nodes if rid != root_a)
+    state.expander.children_to_return = [
+        GeneratedChild(text="the canonical claim", stance="pro", label="strong"),
+    ]
+    client.post(f"/node/{root_b}/expand", data={"n_pros": "1", "n_cons": "0"})
+    nodes = state.replay()
+    new_pro = next(n for n in nodes.values() if n.parent_id == root_b and n.stance == "pro")
+
+    body = client.get(f"/node/{new_pro.id}").data.decode()
+    assert "Potential duplicates" in body
+    # The existing canonical claim is listed in the section
+    assert f'href="/node/{existing_pro}"' in body
 
 
 def test_expand_404_for_missing_node(client):

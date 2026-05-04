@@ -211,13 +211,15 @@ def add_child(state: AppState, parent_id: str, text: str, stance: str) -> str:
 
 
 _DEDUP_COSINE_THRESHOLD = 0.85
+_DEDUP_MAX_SUGGESTIONS = 3
 
 
-def _find_dedup_match(state: AppState, text: str, stance: str, parent_id: str) -> str | None:
-    """Find an existing live same-stance node whose text is similar enough to be
-    treated as a duplicate. Excludes the parent itself and nodes already under
-    this parent (so we never alias something that's already a real child).
-    Returns the existing node id, or None if no match.
+def _find_potential_dupes(
+    state: AppState, text: str, stance: str, parent_id: str,
+) -> list[str]:
+    """Return up to N existing same-stance node ids whose text looks similar
+    enough to be worth suggesting as potential duplicates. Excludes the parent
+    itself and nodes already under this parent.
     """
     nodes = state.replay()
     parent = nodes.get(parent_id)
@@ -231,12 +233,12 @@ def _find_dedup_match(state: AppState, text: str, stance: str, parent_id: str) -
         and n.id not in parent_children
     ]
     if not candidates:
-        return None
+        return []
     results = find_similar_in_nodes(
         text, nodes, state.node_embeddings,
-        k=1, threshold=_DEDUP_COSINE_THRESHOLD, scope=candidates,
+        k=_DEDUP_MAX_SUGGESTIONS, threshold=_DEDUP_COSINE_THRESHOLD, scope=candidates,
     )
-    return results[0][0] if results else None
+    return [nid for nid, _cos in results]
 
 
 def _expand_one_child(state: AppState, parent_id: str, stance: str) -> str | None:
@@ -272,24 +274,19 @@ def _expand_one_child(state: AppState, parent_id: str, stance: str) -> str | Non
         return None
     new_id: str | None = None
     for spec in specs:
-        # Dedup before creating: if we find a same-stance node with very similar
-        # text already in the tree, link to it instead of duplicating.
-        match_id = _find_dedup_match(state, spec.text, spec.stance, parent_id)
-        if match_id is not None:
-            state.event_log.append({
-                "t": "node_aliased",
-                "parent": parent_id,
-                "child": match_id,
-                "reason": "embedding-cosine match during expansion",
-                "src": "expander",
-            })
-            new_id = match_id
-            continue
         nid = create_node(state, spec.text, parent_id=parent.id, stance=spec.stance)
         new_id = nid
         if spec.label is not None:
             state.event_log.append({
                 "t": "node_scored", "id": nid, "label": spec.label, "src": "expander",
+            })
+        # Suggest potential duplicates (informational — the new node stays).
+        for dupe_id in _find_potential_dupes(state, spec.text, spec.stance, parent_id):
+            state.event_log.append({
+                "t": "node_potential_dupe",
+                "id": nid,
+                "dupe_of": dupe_id,
+                "src": "expander",
             })
     return new_id
 
@@ -480,6 +477,11 @@ def create_app(state: AppState) -> Flask:
             and live_children_count < expanding_total
         )
 
+        # Resolve potential dupes for the article (template-friendly Node objects).
+        potential_dupes = _live(nodes, n.potential_dupes) if n.potential_dupes else []
+
+        # Children's potential-dupes are rendered as superscript links —
+        # template just needs `nodes` to look up text on hover.
         return render_template(
             "node.html",
             node=n, parent=parent, pros=pros, cons=cons, negations=negations,
@@ -487,6 +489,8 @@ def create_app(state: AppState) -> Flask:
             expanding_total=expanding_total,
             live_children_count=live_children_count,
             sort_by=sort_by,
+            potential_dupes=potential_dupes,
+            nodes_by_id=nodes,
         )
 
     @app.route("/submit", methods=["POST"])

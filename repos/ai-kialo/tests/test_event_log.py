@@ -198,44 +198,44 @@ def test_resolve_handles_deleted_target(tmp_path):
     assert resolve(nodes, "n1") is None
 
 
-def test_node_aliased_adds_extra_parent_edge(tmp_path):
-    """node_aliased adds an additional parent→child edge without creating a new node.
-    The aliased child shows up in the new parent's children alongside its original
-    parent's children list."""
+def test_node_potential_dupe_records_suggestion(tmp_path):
+    """node_potential_dupe records that node `id` looks similar to `dupe_of`,
+    surfacing as `node.potential_dupes` for UI rendering. The new node stays
+    in place — this is informational, not a structural change."""
     log = EventLog(tmp_path / "log.jsonl")
-    _root(log, "p1", "parent one")
-    _root(log, "p2", "parent two")
-    _child(log, "c", "p1", "pro", "child of p1")
-    log.append({"t": "node_aliased", "parent": "p2", "child": "c", "reason": "dedup"})
+    _root(log, "p", "parent")
+    _child(log, "a", "p", "pro", "argument A")
+    _child(log, "b", "p", "pro", "argument B")
+    log.append({"t": "node_potential_dupe", "id": "b", "dupe_of": "a"})
     nodes = log.replay()
-    assert "c" in nodes["p1"].children   # original parent
-    assert "c" in nodes["p2"].children   # extra parent via alias
-    assert "p2" in nodes["c"].aliased_in
+    assert nodes["b"].potential_dupes == ["a"]
+    # b is still a normal child of p — not aliased, not merged
+    assert "b" in nodes["p"].children
 
 
-def test_node_aliased_no_duplicate_in_children(tmp_path):
-    """Same alias emitted twice doesn't add the child twice."""
+def test_node_potential_dupe_no_duplicate_in_list(tmp_path):
+    """Same suggestion emitted twice keeps the list de-duplicated."""
     log = EventLog(tmp_path / "log.jsonl")
-    _root(log, "p1", "p1")
-    _root(log, "p2", "p2")
-    _child(log, "c", "p1", "pro", "c")
-    log.append({"t": "node_aliased", "parent": "p2", "child": "c"})
-    log.append({"t": "node_aliased", "parent": "p2", "child": "c"})
+    _root(log, "p", "parent")
+    _child(log, "a", "p", "pro", "A")
+    _child(log, "b", "p", "pro", "B")
+    log.append({"t": "node_potential_dupe", "id": "b", "dupe_of": "a"})
+    log.append({"t": "node_potential_dupe", "id": "b", "dupe_of": "a"})
     nodes = log.replay()
-    assert nodes["p2"].children.count("c") == 1
+    assert nodes["b"].potential_dupes == ["a"]
 
 
-def test_aliased_child_excluded_when_deleted(tmp_path):
-    """If the aliased child gets deleted, it stops appearing under the alias parent."""
+def test_node_potential_dupe_multiple_suggestions(tmp_path):
+    """A node can have several potential duplicates recorded in the order emitted."""
     log = EventLog(tmp_path / "log.jsonl")
-    _root(log, "p1", "p1")
-    _root(log, "p2", "p2")
-    _child(log, "c", "p1", "pro", "c")
-    log.append({"t": "node_aliased", "parent": "p2", "child": "c"})
-    log.append({"t": "node_deleted", "id": "c"})
+    _root(log, "p", "parent")
+    _child(log, "a", "p", "pro", "A")
+    _child(log, "b", "p", "pro", "B")
+    _child(log, "c", "p", "pro", "C")
+    log.append({"t": "node_potential_dupe", "id": "c", "dupe_of": "a"})
+    log.append({"t": "node_potential_dupe", "id": "c", "dupe_of": "b"})
     nodes = log.replay()
-    assert "c" not in nodes["p2"].children
-    assert "c" not in nodes["p1"].children
+    assert nodes["c"].potential_dupes == ["a", "b"]
 
 
 def test_replay_reconstructs_from_disk_only(tmp_path):
